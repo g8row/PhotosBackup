@@ -1,0 +1,25 @@
+{
+  "name": "Photos Backup",
+  "identifier": "com.g8row.photosbackup.source",
+  "subtitle": "On-device Google Photos backup",
+  "website": "https://github.com/g8row/PhotosBackup",
+  "apps": [
+    {
+      "name": "Photos Backup",
+      "bundleIdentifier": "com.g8row.photosbackup",
+      "developerName": "g8row",
+      "localizedDescription": "## Fixed\n\n- **Back Up Now no longer stops after 250 photos.** ([#6](https://github.com/g8row/PhotosBackup/issues/6))\n\n  **Back Up Now** queued one page of 250 and left the rest to a loop that was gated on the same conditions as automatic scheduling — including *\"Automatic Backup is turned off\"*, which is exactly what **Stop Backup** sets. With the toggle off that loop exited before doing anything, so the button uploaded 250 items and stopped, and the rest of the album stayed off the queue until you tapped again. **Re-check Backups** shares the loop and had the same cap, which is why it looked like it cleared the queue and then refilled only a fraction of it.\n\n  A manual run is you asking right now, so it no longer consults the automatic-backup toggle at all. It still stops when the app leaves the foreground, the account becomes unusable, or backup is paused.\n\n- **The whole selection now goes into the queue at once.** Paging the foreground meant the queue only ever held a slice of the work. Both buttons now queue everything, and the **simultaneous uploads** setting decides how much of it moves at a time. Background windows keep their 250-item batch, which only bounds memory — the queue is durable, so whatever one window cannot finish waits for the next.\n\n- **The count the buttons report is now the real total.** \"Backing up 250 items\" was the size of the first page. It is now everything the run will attempt, including failures released for retry.\n\n- **A photo waiting on an iCloud download no longer stalls the rest of the run.** Those rows never finish on their own, and the run treated them as work in progress — so one of them held the run open indefinitely and nothing further was queued behind it.\n\n## Notes\n\n- 107 tests, 104 passing (2 opt-in live tests and 1 Simulator Keychain test skipped).\n- **The Simulator cannot run background uploads or schedule background tasks.** Use a device to exercise real backup behaviour.\n",
+      "iconURL": "https://raw.githubusercontent.com/g8row/PhotosBackup/main/App/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png",
+      "versions": [
+        {
+          "version": "0.3.4",
+          "date": "2026-09-08T20:39:03Z",
+          "localizedDescription": "## Fixed\n\n- **Back Up Now no longer stops after 250 photos.** ([#6](https://github.com/g8row/PhotosBackup/issues/6))\n\n  **Back Up Now** queued one page of 250 and left the rest to a loop that was gated on the same conditions as automatic scheduling — including *\"Automatic Backup is turned off\"*, which is exactly what **Stop Backup** sets. With the toggle off that loop exited before doing anything, so the button uploaded 250 items and stopped, and the rest of the album stayed off the queue until you tapped again. **Re-check Backups** shares the loop and had the same cap, which is why it looked like it cleared the queue and then refilled only a fraction of it.\n\n  A manual run is you asking right now, so it no longer consults the automatic-backup toggle at all. It still stops when the app leaves the foreground, the account becomes unusable, or backup is paused.\n\n- **The whole selection now goes into the queue at once.** Paging the foreground meant the queue only ever held a slice of the work. Both buttons now queue everything, and the **simultaneous uploads** setting decides how much of it moves at a time. Background windows keep their 250-item batch, which only bounds memory — the queue is durable, so whatever one window cannot finish waits for the next.\n\n- **The count the buttons report is now the real total.** \"Backing up 250 items\" was the size of the first page. It is now everything the run will attempt, including failures released for retry.\n\n- **A photo waiting on an iCloud download no longer stalls the rest of the run.** Those rows never finish on their own, and the run treated them as work in progress — so one of them held the run open indefinitely and nothing further was queued behind it.\n\n## Notes\n\n- 107 tests, 104 passing (2 opt-in live tests and 1 Simulator Keychain test skipped).\n- **The Simulator cannot run background uploads or schedule background tasks.** Use a device to exercise real backup behaviour.\n",
+          "downloadURL": "https://github.com/g8row/PhotosBackup/releases/download/0.3.4/PhotosBackup.ipa",
+          "size": 2417353,
+          "minOSVersion": "15.0"
+        }
+      ]
+    }
+  ]
+}
