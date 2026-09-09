@@ -1,0 +1,65 @@
+name: update-source
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-source
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            > release.json
+          test "$(jq -r '[.assets[] | select(.name | endswith(".ipa"))] | length' release.json)" != "0" \
+            || { echo "No .ipa file fetched in releases"; exit 1; }
+
+      - name: Genera docs/apps.json
+        run: |
+          mkdir -p docs
+          jq '
+            (.assets[] | select(.name | endswith(".ipa"))) as $a |
+            {
+              name: "Photos Backup",
+              identifier: "com.g8row.photosbackup.source",
+              subtitle: "On-device Google Photos backup",
+              website: "https://github.com/g8row/PhotosBackup",
+              apps: [{
+                name: "Photos Backup",
+                bundleIdentifier: "com.g8row.photosbackup",
+                developerName: "g8row",
+                localizedDescription: (.body // ""),
+                iconURL: "https://github.com/g8row/PhotosBackup/raw/main/App/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png",
+                versions: [{
+                  version: (.tag_name | ltrimstr("v")),
+                  date: .published_at,
+                  localizedDescription: (.body // ""),
+                  downloadURL: $a.browser_download_url,
+                  size: $a.size,
+                  minOSVersion: "15.0"
+                }]
+              }]
+            }' release.json > docs/apps.json
+          rm release.json
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/apps.json
+          git diff --quiet --cached || (git commit -m "source: update apps.json" && git push)
