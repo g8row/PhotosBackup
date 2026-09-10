@@ -1,0 +1,119 @@
+name: update-source
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-source
+  cancel-in-progress: false
+
+env:
+  # Repository that publishes the releases this source tracks.
+  UPSTREAM_REPO: g8row/PhotosBackup
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve source repository
+        id: src
+        run: |
+          # A release event only ever fires on the repository that owns the
+          # release, so that repository is authoritative. On a manual run from
+          # a fork there are no local releases, so fall back to upstream.
+          if [ "${{ github.event_name }}" = "release" ]; then
+            repo="${{ github.repository }}"
+          else
+            repo="${UPSTREAM_REPO}"
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "Reading releases from $repo"
+
+      - name: Fetch latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ steps.src.outputs.repo }}
+        run: |
+          # The default token is scoped to this repository. When the workflow
+          # runs in a fork it still reads a public upstream fine, but an
+          # unauthenticated fallback keeps it working if the token is refused.
+          code=$(curl -sL -o release.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/latest")
+
+          if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+            code=$(curl -sL -o release.json -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases/latest")
+          fi
+
+          if [ "$code" != "200" ]; then
+            echo "GitHub API returned HTTP $code for $REPO:"
+            cat release.json
+            exit 1
+          fi
+
+          # Guard before jq iterates: a "Not Found" body has no .assets at all.
+          if ! jq -e 'has("assets")' release.json > /dev/null; then
+            echo "Unexpected API payload:"
+            cat release.json
+            exit 1
+          fi
+
+          count=$(jq '[.assets[] | select(.name | endswith(".ipa"))] | length' release.json)
+          if [ "$count" -eq 0 ]; then
+            echo "Release $(jq -r .tag_name release.json) has no .ipa asset attached."
+            exit 1
+          fi
+
+      - name: Build docs/apps.json
+        env:
+          REPO: ${{ steps.src.outputs.repo }}
+        run: |
+          mkdir -p docs
+          jq --arg repo "$REPO" '
+            (.assets[] | select(.name | endswith(".ipa"))) as $ipa |
+            {
+              name: "Photos Backup",
+              identifier: "com.g8row.photosbackup.source",
+              subtitle: "On-device Google Photos backup",
+              website: ("https://github.com/" + $repo),
+              apps: [{
+                name: "Photos Backup",
+                bundleIdentifier: "com.g8row.photosbackup",
+                developerName: "g8row",
+                localizedDescription: (.body // ""),
+                iconURL: ("https://raw.githubusercontent.com/" + $repo
+                  + "/main/App/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png"),
+                versions: [{
+                  version: (.tag_name | ltrimstr("v")),
+                  date: .published_at,
+                  localizedDescription: (.body // ""),
+                  downloadURL: $ipa.browser_download_url,
+                  size: $ipa.size,
+                  minOSVersion: "15.0"
+                }]
+              }]
+            }' release.json > docs/apps.json
+          rm release.json
+          jq . docs/apps.json > /dev/null   # fail loudly on malformed output
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/apps.json
+          if git diff --quiet --cached; then
+            echo "No change."
+          else
+            git commit -m "source: update apps.json"
+            git push
+          fi
