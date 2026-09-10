@@ -34,6 +34,10 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     private var watchdog: Timer?
     private var eventsFinished = false
     private var eventsDrainer: (@Sendable () async -> Void)?
+    /// Results delivered since iOS last woke the app for this session, for the
+    /// summary logged when it finishes delivering them.
+    private var deliveredSucceeded = 0
+    private var deliveredFailed = 0
 
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
@@ -148,12 +152,95 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
             ))
             cancelTask(transferID: id)
         }
+        if !stalled.isEmpty {
+            DiagnosticEventLog.shared.record(
+                "transport",
+                "Cancelled \(stalled.count) transfer(s) after 900 seconds without progress",
+                level: .warning
+            )
+        }
         stopWatchdogIfIdle()
     }
 
     func forget(transferID: UUID) async {
         try? FileManager.default.removeItem(at: resultURL(for: transferID))
         clearRuntimeState(for: transferID)
+    }
+
+    /// Completed results normally disappear after commit. A crash, queue reset,
+    /// or account switch can leave a small orphan behind. The age grace period
+    /// prevents cleanup from racing a result that a delegate has just written.
+    func purgeResults(
+        excluding retainedIDs: Set<UUID>,
+        olderThan cutoff: Date = Date().addingTimeInterval(-24 * 60 * 60)
+    ) async {
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: resultsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for child in children {
+            guard child.pathExtension == "json",
+                  let id = UUID(uuidString: child.deletingPathExtension().lastPathComponent),
+                  !retainedIDs.contains(id),
+                  let values = try? child.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let modified = values.contentModificationDate,
+                  modified < cutoff else { continue }
+            try? FileManager.default.removeItem(at: child)
+        }
+    }
+
+    func diagnosticSnapshot() async -> BackgroundTransferDiagnosticSnapshot {
+        let tasks: [URLSessionTask] = await withCheckedContinuation { continuation in
+            session.getAllTasks { continuation.resume(returning: $0) }
+        }
+        var states: [String: Int] = [:]
+        var sent: Int64 = 0
+        var expected: Int64 = 0
+        for task in tasks {
+            let state: String
+            switch task.state {
+            case .running: state = "running"
+            case .suspended: state = "suspended"
+            case .canceling: state = "canceling"
+            case .completed: state = "completed"
+            @unknown default: state = "unknown"
+            }
+            states[state, default: 0] += 1
+            sent += max(0, task.countOfBytesSent)
+            expected += max(0, task.countOfBytesExpectedToSend)
+        }
+
+        let resultFiles = (try? FileManager.default.contentsOfDirectory(
+            at: resultsDirectory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        let resultBytes = resultFiles.reduce(Int64(0)) { total, url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return total + Int64(size)
+        }
+
+        let runtime = runtimeCounts()
+        return BackgroundTransferDiagnosticSnapshot(
+            taskStates: states,
+            bytesSent: sent,
+            bytesExpected: expected,
+            storedResultCount: resultFiles.count,
+            storedResultBytes: resultBytes,
+            waiterCount: runtime.waiters,
+            startingCount: runtime.starting,
+            progressTrackedCount: runtime.tracked,
+            awaitingRelaunchDrain: runtime.awaitingDrain
+        )
+    }
+
+    /// Synchronous, so the lock is never held across a suspension point.
+    private func runtimeCounts() -> (waiters: Int, starting: Int, tracked: Int, awaitingDrain: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (waiters.values.reduce(0) { $0 + $1.count }, starting.count, lastProgressAt.count,
+                eventsFinished || !relaunchCompletions.isEmpty)
     }
 
     private func clearRuntimeState(for transferID: UUID) {
@@ -178,8 +265,11 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     func handleEvents(completionHandler: @escaping () -> Void) {
         lock.lock()
         eventsFinished = false
+        deliveredSucceeded = 0
+        deliveredFailed = 0
         relaunchCompletions.append(completionHandler)
         lock.unlock()
+        DiagnosticEventLog.shared.record("transport", "iOS woke the app to deliver background upload results")
         _ = session
         finishRelaunchIfPossible()
     }
@@ -199,10 +289,19 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
                 }
                 reporter?(task.countOfBytesSent, max(task.countOfBytesExpectedToSend, task.countOfBytesSent))
                 if task.state == .suspended { task.resume() }
+                DiagnosticEventLog.shared.record(
+                    "transport",
+                    "Reattached to an upload that iOS kept transferring in the background"
+                )
                 return
             }
 
             guard FileManager.default.fileExists(atPath: file.path) else {
+                DiagnosticEventLog.shared.record(
+                    "transport",
+                    "An upload's staged copy was missing, so it could not be handed to iOS; the item will be prepared again",
+                    level: .warning
+                )
                 self.resolve(transferID, with: StoredResult(
                     url: request.url, statusCode: nil, headers: [:], body: Data(),
                     errorCode: NSFileNoSuchFileError,
@@ -351,7 +450,14 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         relaunchCompletions = []
         lock.unlock()
         Task {
+            let started = Date()
             await drainer()
+            DiagnosticEventLog.shared.record(
+                "transport",
+                "Handed control back to iOS after \(Int(Date().timeIntervalSince(started).rounded())) s of handling upload results"
+            )
+            // iOS may suspend the process as soon as the handler runs.
+            DiagnosticEventLog.shared.flush()
             await MainActor.run { completions.forEach { $0() } }
         }
     }
@@ -396,18 +502,69 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
             errorDescription: error?.localizedDescription
         )
         store(stored, for: transferID)
+        let succeeded = error == nil && (http.map { (200..<300).contains($0.statusCode) } ?? false)
+        lock.lock()
+        if succeeded { deliveredSucceeded += 1 } else { deliveredFailed += 1 }
+        lock.unlock()
+        // Successes are summarised when iOS finishes delivering; one entry per
+        // photo would crowd a large backup's failures out of the timeline.
+        if !succeeded, urlError?.code != .cancelled {
+            let what = error.map { GPMCError.describeTransport($0) + (urlError.map { " (URLError \($0.errorCode))" } ?? "") }
+                ?? "Google answered HTTP \(http?.statusCode.description ?? "without a status")"
+            DiagnosticEventLog.shared.record(
+                "transport",
+                "A background upload did not complete: \(what); response \(body.count) bytes",
+                level: .warning
+            )
+        }
         resolve(transferID, with: stored)
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         lock.lock()
         eventsFinished = true
+        let succeeded = deliveredSucceeded
+        let failed = deliveredFailed
+        deliveredSucceeded = 0
+        deliveredFailed = 0
         lock.unlock()
+        DiagnosticEventLog.shared.record(
+            "transport",
+            "iOS finished delivering background upload results: \(succeeded) transferred, \(failed) did not",
+            level: failed > 0 ? .warning : .info
+        )
         finishRelaunchIfPossible()
     }
 }
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Not called when iOS merely prewarms the process, so everything recorded
+    /// here describes a real launch. It cannot say which kind: with scenes, the
+    /// application state is still `.background` here even when the user opened
+    /// the app. "Opened the app" or the background run that follows says that.
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        let version = DiagnosticProcessInfo.appVersion
+        if let previous = AppSessionTracker.beginLaunch(inBackground: false, version: version) {
+            DiagnosticEventLog.shared.record("lifecycle", previous.message, level: previous.level)
+        }
+        var conditions = [
+            "version \(version)",
+            "iOS \(UIDevice.current.systemVersion)",
+            "Background App Refresh \(DiagnosticProcessInfo.backgroundRefresh(application.backgroundRefreshStatus))",
+            "Low Power Mode \(ProcessInfo.processInfo.isLowPowerModeEnabled ? "on" : "off")",
+        ]
+        if !application.isProtectedDataAvailable { conditions.append("device locked") }
+        DiagnosticEventLog.shared.record(
+            "lifecycle",
+            "App process started; " + conditions.joined(separator: "; "),
+            level: application.backgroundRefreshStatus == .available ? .info : .warning
+        )
+        DiagnosticSystemObserver.shared.start()
+        CrashDiagnosticsCollector.shared.start()
+        return true
+    }
+
     func application(_ application: UIApplication,
                      handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {

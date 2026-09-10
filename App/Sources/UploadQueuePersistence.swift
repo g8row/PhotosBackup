@@ -53,10 +53,14 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
     let checkpoint: UploadCheckpoint?
     /// Optional so snapshots written by earlier releases remain decodable.
     let cancelled: Bool?
+    /// How many times the process died while this row was being prepared. Nil
+    /// for zero, so ordinary rows are encoded exactly as before.
+    let interruptedPreparations: Int?
 
     init(id: UUID, source: PersistedMediaSource, name: String, byteCount: Int64,
          attempts: Int, failureReason: String?, failureRetryable: Bool,
-         checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil) {
+         checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil,
+         interruptedPreparations: Int? = nil) {
         self.id = id
         self.source = source
         self.name = name
@@ -66,7 +70,45 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
         self.failureRetryable = failureRetryable
         self.checkpoint = checkpoint
         self.cancelled = cancelled
+        self.interruptedPreparations = interruptedPreparations
     }
+}
+
+/// Remembers which rows were mid-preparation — exporting from Photos, hashing,
+/// asking Google for an upload URL — while the app was executing. A row still
+/// marked at the next launch was being prepared when the process died, which is
+/// what a crash or a memory-limit termination on that one item looks like.
+protocol PreparationMarkerStoring: AnyObject {
+    func load() -> Set<UUID>
+    func save(_ ids: Set<UUID>)
+}
+
+/// UserDefaults rather than a file: each write reaches cfprefsd straight away,
+/// so it survives the process being killed a moment later — the only case
+/// these markers exist for.
+final class UserDefaultsPreparationMarkers: PreparationMarkerStoring {
+    private let defaults: UserDefaults
+    private let key = "queue.preparingItemIDs.v1"
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> Set<UUID> {
+        Set((defaults.stringArray(forKey: key) ?? []).compactMap(UUID.init(uuidString:)))
+    }
+
+    func save(_ ids: Set<UUID>) {
+        if ids.isEmpty { defaults.removeObject(forKey: key) }
+        else { defaults.set(ids.map(\.uuidString).sorted(), forKey: key) }
+    }
+}
+
+final class MemoryPreparationMarkers: PreparationMarkerStoring {
+    private(set) var ids: Set<UUID>
+
+    init(_ ids: Set<UUID> = []) { self.ids = ids }
+
+    func load() -> Set<UUID> { ids }
+    func save(_ ids: Set<UUID>) { self.ids = ids }
 }
 
 struct UploadQueueSnapshot: Codable, Equatable, Sendable {

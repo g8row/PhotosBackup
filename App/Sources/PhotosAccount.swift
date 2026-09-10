@@ -58,14 +58,28 @@ final class PhotosAccount: ObservableObject {
     /// the first upload (or an explicit `verify()`) is what proves the token.
     func restore() async {
         do {
-            guard let credential = try await store.load() else { status = .disconnected; return }
+            guard let credential = try await store.load() else {
+                status = .disconnected
+                DiagnosticEventLog.shared.record("account", "No saved Google account")
+                return
+            }
             adopt(credential)
+            if case .rejected(_, let reason) = status {
+                DiagnosticEventLog.shared.record("account", "The saved Google account could not be used: \(reason)", level: .error)
+            } else {
+                DiagnosticEventLog.shared.record("account", "Restored the saved Google account")
+            }
         } catch {
             // Nothing has been connected yet, so an unreadable store is not a
             // rejected account — it just means there is nothing to restore.
             credential = nil; client = nil
             persistenceWarning = Self.describe(error)
             status = .disconnected
+            DiagnosticEventLog.shared.record(
+                "account",
+                "Could not read the saved credential from the Keychain: \(Self.describe(error))",
+                level: .error
+            )
         }
     }
 
@@ -74,11 +88,18 @@ final class PhotosAccount: ObservableObject {
         do {
             adopt(try await store.save(result))
             persistenceWarning = nil
+            DiagnosticEventLog.shared.record("account", "Connected a Google account and saved it to the Keychain")
         } catch let unpersisted as CredentialStore.Unpersisted {
             adopt(unpersisted.credential)
             persistenceWarning = unpersisted.reason
+            DiagnosticEventLog.shared.record(
+                "account",
+                "Connected a Google account, but it could not be saved to the Keychain, so it lasts only until the app closes: \(unpersisted.reason)",
+                level: .warning
+            )
         } catch {
             status = .rejected(email: result.email, reason: Self.describe(error))
+            DiagnosticEventLog.shared.record("account", "Could not connect the Google account: \(Self.describe(error))", level: .error)
         }
     }
 
@@ -87,6 +108,7 @@ final class PhotosAccount: ObservableObject {
         credential = nil; client = nil
         persistenceWarning = nil
         status = .disconnected
+        DiagnosticEventLog.shared.record("account", "You disconnected the Google account")
     }
 
     /// Optional round trip to Google. Only worth running when the user asks —
@@ -100,9 +122,11 @@ final class PhotosAccount: ObservableObject {
         do {
             try await client.validateReadAccess()
             if let credential { status = .connected(email: credential.email, since: credential.connectedAt) }
+            DiagnosticEventLog.shared.record("account", "Connection check passed: Google accepted the credential")
             return .succeeded
         } catch {
             report(error)
+            DiagnosticEventLog.shared.record("account", "Connection check failed: \(Self.describe(error))", level: .warning)
             return .failed(Self.describe(error))
         }
     }
@@ -119,6 +143,11 @@ final class PhotosAccount: ObservableObject {
         let email = credential?.email ?? ""
         status = .rejected(email: email, reason: gpmc.message)
         client = nil
+        DiagnosticEventLog.shared.record(
+            "account",
+            "Google refused the stored credential; the account has to be connected again. \(gpmc.message)",
+            level: .error
+        )
     }
 
     private func adopt(_ credential: StoredCredential) {

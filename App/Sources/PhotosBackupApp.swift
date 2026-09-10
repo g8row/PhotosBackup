@@ -45,7 +45,13 @@ struct PhotosBackupApp: App {
         _albums = StateObject(wrappedValue: albums)
         self.network = network
         self.automaticBackup = automaticBackup
-        network.onStatusChange = { [weak automaticBackup] _ in automaticBackup?.networkDidChange() }
+        if #available(iOS 16.0, *) {
+            BackupShortcutBridge.coordinator = automaticBackup
+        }
+        network.onStatusChange = { [weak automaticBackup] status in
+            DiagnosticEventLog.shared.record("network", "Connection changed to \(status.diagnosticLabel)")
+            automaticBackup?.networkDidChange()
+        }
         network.start()
         automaticBackup.applyNetworkPolicy()
     }
@@ -64,20 +70,47 @@ struct PhotosBackupApp: App {
                 .onChange(of: scenePhase) { phase in
                     switch phase {
                     case .active:
+                        AppSessionTracker.note(.active)
                         automaticBackup.applicationDidBecomeActive()
+                    case .inactive:
+                        AppSessionTracker.note(.inactive)
                     case .background:
+                        AppSessionTracker.note(.background)
                         automaticBackup.applicationDidEnterBackground()
-                    default:
+                    @unknown default:
                         break
                     }
                 }
-                .onChange(of: preferences.connection) { _ in automaticBackup.connectionPreferenceDidChange() }
-                .onChange(of: preferences.storageSaver) { value in queue.options.storageSaver = value }
-                .onChange(of: preferences.useQuota) { value in queue.options.useQuota = value }
-                .onChange(of: preferences.concurrentUploads) { value in queue.setMaxConcurrent(value) }
-                .onChange(of: preferences.automaticBackup) { _ in automaticBackup.backupConfigurationDidChange() }
-                .onChange(of: preferences.selectedAlbumIDs) { _ in automaticBackup.backupConfigurationDidChange() }
-                .onChange(of: preferences.completedOnboarding) { _ in automaticBackup.backupConfigurationDidChange() }
+                // Settings changes are logged here, where each one is applied,
+                // so a report shows what the user changed and when.
+                .onChange(of: preferences.connection) { value in
+                    DiagnosticEventLog.shared.record("settings", "Connection set to \(value.title)")
+                    automaticBackup.connectionPreferenceDidChange()
+                }
+                .onChange(of: preferences.storageSaver) { value in
+                    DiagnosticEventLog.shared.record("settings", "Storage Saver turned \(value ? "on" : "off")")
+                    queue.options.storageSaver = value
+                }
+                .onChange(of: preferences.useQuota) { value in
+                    DiagnosticEventLog.shared.record("settings", "Count Against Storage Quota turned \(value ? "on" : "off")")
+                    queue.options.useQuota = value
+                }
+                .onChange(of: preferences.concurrentUploads) { value in
+                    DiagnosticEventLog.shared.record("settings", "Simultaneous uploads set to \(value)")
+                    queue.setMaxConcurrent(value)
+                }
+                .onChange(of: preferences.automaticBackup) { value in
+                    DiagnosticEventLog.shared.record("settings", "Automatic Backup turned \(value ? "on" : "off")")
+                    automaticBackup.backupConfigurationDidChange()
+                }
+                .onChange(of: preferences.selectedAlbumIDs) { value in
+                    DiagnosticEventLog.shared.record("settings", "Album selection changed; \(value.count) selected")
+                    automaticBackup.backupConfigurationDidChange()
+                }
+                .onChange(of: preferences.completedOnboarding) { value in
+                    if value { DiagnosticEventLog.shared.record("settings", "Finished onboarding") }
+                    automaticBackup.backupConfigurationDidChange()
+                }
                 .onChange(of: account.status) { _ in automaticBackup.accountDidChange() }
         }
     }

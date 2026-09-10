@@ -21,6 +21,19 @@ enum BackupNetworkStatus: Equatable, Sendable {
     }
 }
 
+extension BackupNetworkStatus {
+    var diagnosticLabel: String {
+        switch self {
+        case .checking: return "checking"
+        case .unavailable: return "unavailable"
+        case .wifi: return "Wi-Fi"
+        case .cellular: return "cellular"
+        case .wired: return "wired"
+        case .other: return "other"
+        }
+    }
+}
+
 struct NetworkPolicyDecision: Equatable, Sendable {
     let allowsUploads: Bool
     let pauseReason: String?

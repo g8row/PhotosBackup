@@ -184,6 +184,14 @@ struct AuthData {
     }
 }
 
+private func drainingAutoreleasePool<T>(_ body: () throws -> T) rethrows -> T {
+#if canImport(ObjectiveC)
+    try autoreleasepool(invoking: body)
+#else
+    try body()
+#endif
+}
+
 /// Forwards `URLSession` upload progress. A per-task delegate, so one instance
 /// serves exactly one request and dies with it.
 private final class ProgressDelegate: NSObject, URLSessionTaskDelegate {
@@ -268,6 +276,11 @@ actor GPMCClient {
             configuration.waitsForConnectivity = true
             configuration.timeoutIntervalForRequest = 120
             configuration.timeoutIntervalForResource = 60 * 60
+            // These authenticated protobuf calls are stateful and never benefit
+            // from an HTTP response cache. Keeping it disabled also avoids a
+            // growing Cache.db full of private API responses.
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            configuration.urlCache = nil
             let session = URLSession(configuration: configuration)
             self.session = session
             self.fileUploadTransport = fileUploadTransport ?? ForegroundFileUploadTransport(session: session)
@@ -412,10 +425,19 @@ actor GPMCClient {
         guard declared > 0 else { throw GPMCError(message: "That item is empty; there is nothing to upload.") }
         phase(.hashing(fraction: 0))
         let handle = try FileHandle(forReadingFrom: file); defer { try? handle.close() }
-        var hasher = Insecure.SHA1(); var size: UInt64 = 0
-        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
-            try Task.checkCancellation(); hasher.update(data: chunk); size += UInt64(chunk.count)
-            phase(.hashing(fraction: min(1, Double(size) / Double(declared))))
+        var hasher = Insecure.SHA1(); var size: UInt64 = 0; var reachedEnd = false
+        // One pool per chunk. This loop never suspends, so an autoreleased read
+        // buffer would otherwise live until the whole file is hashed — for a
+        // multi-gigabyte video, enough to reach iOS's per-app memory limit.
+        while !reachedEnd {
+            try drainingAutoreleasePool {
+                guard let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty else {
+                    reachedEnd = true
+                    return
+                }
+                try Task.checkCancellation(); hasher.update(data: chunk); size += UInt64(chunk.count)
+                phase(.hashing(fraction: min(1, Double(size) / Double(declared))))
+            }
         }
         let hash = Data(hasher.finalize())
         phase(.checkingDuplicate)
@@ -495,6 +517,17 @@ actor GPMCClient {
         return error.message.localizedCaseInsensitiveContains("valid blueprint")
     }
 
+    /// The device model and quality code a commit declares, the same mapping
+    /// upstream gpmc uses. The model decides how Google accounts for the
+    /// upload's storage — an older Pixel's uploads do not count against it — and
+    /// the quality code asks for original bytes (3) or Storage Saver (1). The
+    /// Google Photos app labels an upload from the free-storage models "Storage
+    /// saver" even when the original bytes were kept, which is what issue #11
+    /// reports. Exposed so Diagnostics shows exactly what was sent.
+    static func commitProfile(useQuota: Bool, saver: Bool) -> (model: String, quality: UInt64) {
+        (useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL"), saver ? 1 : 3)
+    }
+
     /// Commit the receipt. This is intentionally a small data request that runs
     /// during the background-session relaunch window.
     ///
@@ -509,8 +542,9 @@ actor GPMCClient {
         try Self.validateReceipt(receipt)
         phase(.finalizing)
         let stamp = UInt64(max(0, prepared.modified.timeIntervalSince1970))
-        let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, saver ? 1 : 3) + Proto.int(10, 1)
-        let device = Proto.string(3, useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
+        let profile = Self.commitProfile(useQuota: useQuota, saver: saver)
+        let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, profile.quality) + Proto.int(10, 1)
+        let device = Proto.string(3, profile.model) + Proto.string(4, "Google") + Proto.int(5, 28)
         let committed: Data
         do {
             committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)

@@ -76,6 +76,9 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     var attempts: Int
     var mediaKey: String?
     var checkpoint: UploadCheckpoint?
+    /// How many times the process died while this row was being prepared.
+    /// See `UploadQueue.noteInterruptedPreparations`.
+    var interruptedPreparations = 0
 
     init(id: UUID = UUID(), source: MediaSource, name: String = "Preparing…") {
         self.id = id; self.source = source; self.name = name
@@ -187,6 +190,18 @@ final class UploadQueue: ObservableObject {
     /// instead of persisted as durable "skip this source" markers.
     private var discardsCancelledRows = false
     private var persistScheduled = false
+    /// See `PreparationMarkerStoring`. Nil where the guard is not exercised.
+    private let preparationMarkers: PreparationMarkerStoring?
+    /// Rows between their start and a prepared checkpoint, mirrored to
+    /// `preparationMarkers` while the guard is armed.
+    private var preparingIDs: Set<UUID> = []
+    /// Off until the coordinator says the app is executing; see
+    /// `setPreparationGuardArmed`.
+    private var preparationGuardArmed = false
+    /// A row the process has died on this many times is skipped, so a single
+    /// item that reliably takes the app down cannot stop every relaunch from
+    /// making progress on the rest.
+    static let interruptedPreparationLimit = 2
 
     // MARK: - Derived state
     //
@@ -286,6 +301,7 @@ final class UploadQueue: ObservableObject {
          maxAttempts: Int = 3,
          persistence: UploadQueuePersisting? = nil,
          checkpointCleaner: UploadCheckpointCleaner? = nil,
+         preparationMarkers: PreparationMarkerStoring? = nil,
          sleeper: @escaping @Sendable (Double) async -> Void = { seconds in
              try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
          }) {
@@ -294,6 +310,7 @@ final class UploadQueue: ObservableObject {
         self.maxAttempts = max(1, maxAttempts)
         self.persistence = persistence
         self.checkpointCleaner = checkpointCleaner
+        self.preparationMarkers = preparationMarkers
         self.sleeper = sleeper
     }
 
@@ -320,6 +337,18 @@ final class UploadQueue: ObservableObject {
             ?? systemPauseReason
     }
     var retainedStagingURLs: Set<URL> { Set(items.compactMap { $0.checkpoint?.fileURL }) }
+    var retainedTransferIDs: Set<UUID> {
+        Set(items.compactMap { item in item.checkpoint?.prepared == nil ? nil : item.id })
+    }
+    var runningCount: Int { running.count }
+    /// Running rows whose bytes are already moving in an iOS background
+    /// transfer, which keeps going after the app is suspended.
+    var runningBackgroundTransferCount: Int {
+        running.keys.reduce(0) { count, id in
+            guard let index = indexByID[id], items[index].checkpoint?.isBackgroundTransfer == true else { return count }
+            return count + 1
+        }
+    }
     /// Cancelled and failed rows are excluded, finished ones count as a whole
     /// item, and the only rows left with a moving fraction are the ones actually
     /// in flight — so this sums at most `maxConcurrent` rows however long the
@@ -385,6 +414,13 @@ final class UploadQueue: ObservableObject {
         appendRows(accepted)
         persistNow()
         pump()
+        if !accepted.isEmpty {
+            DiagnosticEventLog.shared.record(
+                "queue",
+                "Queued \(accepted.count) new item\(accepted.count == 1 ? "" : "s"); the queue holds \(items.count), \(activeCount) unfinished"
+                    + (reachedLimit ? "; batch limit reached, the rest waits for the next scan" : "")
+            )
+        }
         return EnqueueOutcome(accepted: accepted.map(\.id), reachedLimit: reachedLimit)
     }
 
@@ -433,9 +469,16 @@ final class UploadQueue: ObservableObject {
         // Only meaningful while in-flight rows are still settling; leaving it
         // set would silently discard the next single-row cancel as well.
         discardsCancelledRows = cancelledInFlight
+        let before = items.count
         items.removeAll { $0.state == .cancelled }
+        let removed = before - items.count
         rebuildDerivedState()
         persistNow()
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Stop Backup cleared \(removed) unfinished item\(removed == 1 ? "" : "s")"
+                + (cancelledInFlight ? "; uploads in progress are being cancelled" : "")
+        )
     }
 
     static func clampedConcurrency(_ value: Int) -> Int {
@@ -461,12 +504,14 @@ final class UploadQueue: ObservableObject {
         guard !isUserPaused else { return }
         isUserPaused = true
         persistNow()
+        DiagnosticEventLog.shared.record("queue", "You paused backup; uploads already running will finish")
     }
 
     func resumeUserPausedUploads() {
         guard isUserPaused else { return }
         isUserPaused = false
         persistNow()
+        DiagnosticEventLog.shared.record("queue", "You resumed backup")
         pump()
     }
 
@@ -510,19 +555,29 @@ final class UploadQueue: ObservableObject {
         }
         guard released > 0 else { return 0 }
         persistNow()
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Released \(released) failed item\(released == 1 ? "" : "s") for another attempt"
+        )
         pump()
         return released
     }
 
     private func requeue(at index: Int) {
         items[index].attempts = 0
+        // A retry the user asked for gets a fresh allowance from the crash guard.
+        items[index].interruptedPreparations = 0
         setState(.queued, at: index)
     }
 
     func clearFinished() {
+        let before = items.count
         items.removeAll { $0.state.isFinished }
         rebuildDerivedState()
         persistNow()
+        if before > items.count {
+            DiagnosticEventLog.shared.record("queue", "Cleared \(before - items.count) finished items from the activity list")
+        }
     }
 
     /// Number of distinct sources the queue knows are backed up for the
@@ -565,6 +620,10 @@ final class UploadQueue: ObservableObject {
             }
         }
         persistNow()
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Forgot \(keys.count) remembered backup\(keys.count == 1 ? "" : "s") so they are checked against Google again"
+        )
         return keys.count
     }
 
@@ -608,7 +667,12 @@ final class UploadQueue: ObservableObject {
                   snapshot.version == UploadQueueSnapshot.version,
                   snapshot.accountIdentifier == normalized else {
                 completedSourceKeys = Set(ledgerKeys)
+                _ = takePreparationMarkers()
                 persistNow()
+                DiagnosticEventLog.shared.record(
+                    "queue",
+                    "Opened an empty upload queue for the connected account; \(completedSourceKeys.count) items remembered as backed up"
+                )
                 return
             }
             if persistence.storesCompletionLedgerSeparately {
@@ -627,6 +691,7 @@ final class UploadQueue: ObservableObject {
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
                 item.checkpoint = stored.checkpoint
+                item.interruptedPreparations = stored.interruptedPreparations ?? 0
                 if stored.cancelled == true {
                     item.state = .cancelled
                 } else if let reason = stored.failureReason {
@@ -639,9 +704,21 @@ final class UploadQueue: ObservableObject {
             rebuildDerivedState()
             if persistence.storesCompletionLedgerSeparately,
                !snapshot.completedSourceKeys.isEmpty { persistNow() }
+            DiagnosticEventLog.shared.record(
+                "queue",
+                "Restored the upload queue: \(items.count) rows, \(activeCount) unfinished, \(failedCount) failed; \(completedSourceKeys.count) items remembered as backed up"
+                    + (isUserPaused ? "; paused by you" : "")
+            )
+            let interrupted = takePreparationMarkers()
+            if !interrupted.isEmpty { noteInterruptedPreparations(interrupted) }
             pump()
         } catch {
             persistenceWarning = "The saved upload queue could not be restored: \(error.localizedDescription)"
+            DiagnosticEventLog.shared.record(
+                "persistence",
+                "Queue restore failed: \(error.localizedDescription)",
+                level: .error
+            )
         }
     }
 
@@ -655,6 +732,7 @@ final class UploadQueue: ObservableObject {
     /// Clear the halt after the account has been reconnected; everything that
     /// was stopped mid-flight went back to `queued` and picks up here.
     func resume() {
+        if haltReason != nil { DiagnosticEventLog.shared.record("queue", "Resumed the stopped queue") }
         haltReason = nil
         pump()
     }
@@ -666,6 +744,12 @@ final class UploadQueue: ObservableObject {
         let nextReason = allowed ? nil : (pauseReason ?? "Waiting for an allowed connection")
         guard networkPauseReason != nextReason else { return }
         networkPauseReason = nextReason
+        DiagnosticEventLog.shared.record(
+            "queue",
+            // Info, not warning: a pause is the policy working. A report's
+            // summary still names it when it is what holds the queue.
+            allowed ? "Network policy allows uploads" : "Network policy paused uploads: \(nextReason ?? "unknown")"
+        )
         if allowed { pump() }
         // A background transfer keeps the `allowsCellularAccess` it was created
         // with, so iOS will happily finish it over cellular after the policy
@@ -676,10 +760,27 @@ final class UploadQueue: ObservableObject {
         else { cancelRunningForRequeue(includingBackgroundTransfers: true) }
     }
 
+    /// Arm the crash-loop guard while the app executes with iOS's blessing —
+    /// open, or inside a background window — and disarm it when the process is
+    /// about to be suspended. A suspended process can be killed at any moment
+    /// without anything having gone wrong, so a marker left behind then would
+    /// wrongly count against whatever row was being prepared.
+    func setPreparationGuardArmed(_ armed: Bool) {
+        preparationGuardArmed = armed
+        guard !armed, !preparingIDs.isEmpty else { return }
+        preparingIDs = []
+        preparationMarkers?.save([])
+    }
+
     /// Called by the background-task expiration handler. Work remains queued
     /// for the next system execution window or foreground launch.
     func suspendForBackgroundExpiration() {
         systemPauseReason = "Paused until iOS gives the app more time"
+        setPreparationGuardArmed(false)
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Paused new work until iOS gives the app more time; \(activeCount) unfinished, \(runningBackgroundTransferCount) still transferring in iOS"
+        )
         cancelRunningForRequeue()
         flushPendingWrites()
     }
@@ -730,9 +831,10 @@ final class UploadQueue: ObservableObject {
 
     /// Wait for all unfinished queue work. Cancellation is how a background
     /// task tells this loop that its execution window has expired.
-    func waitUntilSettled() async -> Bool {
+    func waitUntilSettled(until deadline: Date? = nil) async -> Bool {
         while !isIdle {
             if Task.isCancelled { return false }
+            if let deadline, Date() >= deadline { return false }
             if networkPauseReason != nil || systemPauseReason != nil { return false }
             if isUserPaused && running.isEmpty { return false }
             if running.isEmpty && !hasWorkableItems {
@@ -750,12 +852,24 @@ final class UploadQueue: ObservableObject {
     /// plus the small commit RPC.
     func waitUntilBackgroundTransfersHandled() async {
         let deadline = Date().addingTimeInterval(25)
-        while Date() < deadline, items.contains(where: { item in
+        while items.contains(where: { item in
             guard let prepared = item.checkpoint?.prepared else { return false }
             return prepared.receipt != nil || (running[item.id] != nil && item.state.isWorking)
         }) {
-            if networkPauseReason != nil || systemPauseReason != nil { return }
+            if let reason = networkPauseReason ?? systemPauseReason {
+                DiagnosticEventLog.shared.record("queue", "Stopped waiting for upload confirmations: \(reason)")
+                return
+            }
             if Task.isCancelled { return }
+            if Date() >= deadline {
+                let unconfirmed = items.filter { $0.checkpoint?.prepared?.receipt != nil }.count
+                DiagnosticEventLog.shared.record(
+                    "queue",
+                    "Used up iOS's relaunch time with \(unconfirmed) transferred upload\(unconfirmed == 1 ? "" : "s") not yet confirmed by Google; they are kept and confirmed at the next opportunity",
+                    level: .warning
+                )
+                return
+            }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
     }
@@ -791,6 +905,13 @@ final class UploadQueue: ObservableObject {
         let id = items[index].id
         setState(.exporting, at: index)
         items[index].attempts += 1
+        // Marked until the row reaches a prepared checkpoint, and written
+        // before the worker starts: the export this guards against can take the
+        // process down at once. See `PreparationMarkerStoring`.
+        if preparationGuardArmed, items[index].checkpoint?.prepared == nil, let preparationMarkers {
+            preparingIDs.insert(id)
+            preparationMarkers.save(preparingIDs)
+        }
         let source = items[index].source
         let checkpoint = items[index].checkpoint
         let options = self.options
@@ -818,6 +939,7 @@ final class UploadQueue: ObservableObject {
             setState(state, at: index)
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
+            if checkpoint?.prepared != nil { clearPreparationMarker(id) }
             // The durable hand-off to the background transfer: this must be on
             // disk before the worker proceeds, not on the next turn.
             persistNow()
@@ -826,6 +948,7 @@ final class UploadQueue: ObservableObject {
 
     private func finish(_ id: UUID, _ outcome: Result<UploadOutcome, Error>) {
         running[id] = nil
+        clearPreparationMarker(id)
         defer { pump() }
         guard let index = index(of: id) else { return }
         switch outcome {
@@ -838,6 +961,9 @@ final class UploadQueue: ObservableObject {
             recordCompletion(for: items[index])
             persist()
         case .failure(let error):
+            // What the row was doing when it failed, before any of the
+            // branches below overwrite it.
+            let stage = items[index].state
             if userCancelled.remove(id) != nil {
                 requeueCancelled.remove(id)
                 setState(.cancelled, at: index)
@@ -860,6 +986,10 @@ final class UploadQueue: ObservableObject {
                 items[index].attempts = max(0, items[index].attempts - 1)
                 setState(.waitingForICloud, at: index)
                 persist()
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Held back an item whose original is only in iCloud; it continues when the app is open and can download it"
+                )
                 return
             }
             let gpmc = error as? GPMCError
@@ -881,9 +1011,16 @@ final class UploadQueue: ObservableObject {
                 setState(.waitingToRetry(attempt: attempt), at: index)
                 persist()
                 scheduleRetry(id, after: min(30, pow(2, Double(attempt))))
+                // No attempt number, so a burst of the same failure folds into
+                // a single timeline entry.
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Will retry an upload after a temporary failure while \(Self.stageDescription(stage)): \(reason)",
+                    level: .warning
+                )
             } else {
                 setState(.failed(reason: reason, retryable: retryable), at: index)
-                recordFailure(name: items[index].name, reason: reason, status: gpmc?.status)
+                recordFailure(name: items[index].name, reason: reason, status: gpmc?.status, stage: stage)
                 cleanCheckpoint(for: index)
                 persist()
             }
@@ -894,6 +1031,13 @@ final class UploadQueue: ObservableObject {
         guard haltReason == nil else { return }
         haltReason = error.message
         recordFailure(name: "Backup stopped", reason: error.message, status: error.status)
+        DiagnosticEventLog.shared.record(
+            "queue",
+            error.kind == .storageFull
+                ? "Stopped the queue: the Google account is out of storage, so no other upload can succeed"
+                : "Stopped the queue: Google refused the credential, so no other upload can succeed until the account is connected again",
+            level: .error
+        )
         cancelRunningForRequeue()
         // Only a credential failure asks the app to reconnect the account. A
         // full account stops the queue just as hard, but the fix is in Google,
@@ -905,10 +1049,28 @@ final class UploadQueue: ObservableObject {
 
     /// Keep the newest failures and drop the oldest, so a long backup that goes
     /// wrong in one way does not bury the one that went wrong differently.
-    private func recordFailure(name: String, reason: String, status: GoogleStatus?) {
+    private func recordFailure(name: String, reason: String, status: GoogleStatus?,
+                               stage: UploadItem.State? = nil) {
         failureCount += 1
         recentFailures.insert(UploadFailure(name: name, reason: reason, statusCode: status?.rawCode), at: 0)
         if recentFailures.count > Self.recentFailureLimit { recentFailures.removeLast() }
+        // The name stays out of the log: it is a filename. The stage says where
+        // it went wrong, Google's code and reason say what Google said.
+        let during = stage.map { " while \(Self.stageDescription($0))" } ?? ""
+        let code = status.map { " [Google code \($0.rawCode)]" } ?? ""
+        DiagnosticEventLog.shared.record("upload", "An upload failed\(during)\(code): \(reason)", level: .error)
+    }
+
+    /// What a row was doing, for a sentence that says where a failure happened.
+    static func stageDescription(_ state: UploadItem.State) -> String {
+        switch state {
+        case .exporting: return "exporting it from Photos"
+        case .hashing: return "reading the file"
+        case .checkingDuplicate: return "asking Google for an existing copy"
+        case .uploading: return "uploading"
+        case .finalizing: return "finishing it in Google Photos"
+        default: return "starting"
+        }
     }
 
     private func cancelRunningForRequeue(includingBackgroundTransfers: Bool = false) {
@@ -961,6 +1123,7 @@ final class UploadQueue: ObservableObject {
         let storedItems = items.compactMap { item -> PersistedUploadItem? in
             guard let source = PersistedMediaSource(item.source)
                     ?? item.checkpoint.map({ .file($0.filePath) }) else { return nil }
+            let interruptions = item.interruptedPreparations > 0 ? item.interruptedPreparations : nil
             switch item.state {
             case .alreadyBackedUp, .done:
                 return nil
@@ -975,13 +1138,15 @@ final class UploadQueue: ObservableObject {
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: reason, failureRetryable: retryable,
-                                           checkpoint: item.checkpoint)
+                                           checkpoint: item.checkpoint,
+                                           interruptedPreparations: interruptions)
             default:
                 // Working and retry-delay states intentionally restore queued.
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: nil, failureRetryable: false,
-                                           checkpoint: item.checkpoint)
+                                           checkpoint: item.checkpoint,
+                                           interruptedPreparations: interruptions)
             }
         }
         let snapshot = UploadQueueSnapshot(
@@ -997,6 +1162,11 @@ final class UploadQueue: ObservableObject {
             if completionLedgerHealthy { persistenceWarning = nil }
         } catch {
             persistenceWarning = "Upload progress could not be saved: \(error.localizedDescription)"
+            DiagnosticEventLog.shared.record(
+                "persistence",
+                "Queue save failed: \(error.localizedDescription)",
+                level: .error
+            )
         }
     }
 
@@ -1009,6 +1179,11 @@ final class UploadQueue: ObservableObject {
         } catch {
             completionLedgerHealthy = false
             persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
+            DiagnosticEventLog.shared.record(
+                "persistence",
+                "Completion ledger save failed: \(error.localizedDescription)",
+                level: .error
+            )
         }
     }
 
@@ -1018,5 +1193,56 @@ final class UploadQueue: ObservableObject {
         items[index].checkpoint = nil
         guard let checkpointCleaner else { return }
         Task { await checkpointCleaner(id, checkpoint) }
+    }
+
+    // MARK: - Crash-loop guard
+
+    /// Read and clear the rows the previous process was preparing when it died.
+    private func takePreparationMarkers() -> Set<UUID> {
+        guard let preparationMarkers else { return [] }
+        let marked = preparationMarkers.load()
+        preparingIDs = []
+        if !marked.isEmpty { preparationMarkers.save([]) }
+        return marked
+    }
+
+    private func clearPreparationMarker(_ id: UUID) {
+        guard preparingIDs.remove(id) != nil else { return }
+        preparationMarkers?.save(preparingIDs)
+    }
+
+    /// The process died while these rows were being prepared. Each goes to the
+    /// back of the queue so everything else gets a turn first, and a row that
+    /// has now stopped the app `interruptedPreparationLimit` times is skipped.
+    /// Without this, one item that reliably crashes the app — a video too large
+    /// to stage, say — is the first thing every relaunch restarts, so the app
+    /// closes again on every open and nothing else ever backs up.
+    private func noteInterruptedPreparations(_ ids: Set<UUID>) {
+        let reason = "Photos Backup closed unexpectedly more than once while preparing this item, so it was skipped to let the rest of the backup continue. Retry it from here, and please send a diagnostic report."
+        var movedToBack: [UploadItem] = []
+        var skipped = 0
+        for index in items.indices where ids.contains(items[index].id) && items[index].state == .queued {
+            items[index].interruptedPreparations += 1
+            if items[index].interruptedPreparations >= Self.interruptedPreparationLimit {
+                // Assigned directly: the derived state is rebuilt below.
+                items[index].state = .failed(reason: reason, retryable: false)
+                cleanCheckpoint(for: index)
+                recordFailure(name: items[index].name, reason: reason, status: nil)
+                skipped += 1
+            } else {
+                movedToBack.append(items[index])
+            }
+        }
+        guard skipped > 0 || !movedToBack.isEmpty else { return }
+        let moved = Set(movedToBack.map(\.id))
+        items.removeAll { moved.contains($0.id) }
+        items.append(contentsOf: movedToBack)
+        rebuildDerivedState()
+        persistNow()
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "The app stopped while preparing \(skipped + movedToBack.count) item\(skipped + movedToBack.count == 1 ? "" : "s") last time; moved \(movedToBack.count) to the end of the queue and skipped \(skipped) that had stopped it before",
+            level: .warning
+        )
     }
 }

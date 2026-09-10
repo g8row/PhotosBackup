@@ -94,10 +94,15 @@ struct PhotosUploader {
     /// Resolved per item rather than captured, so a reconnect swaps the client
     /// under a queue that is already running.
     let client: @Sendable () async -> GPMCClient?
+    /// Items at least this large are noted in the diagnostic log together with
+    /// the memory available, since a large video is the likeliest thing to push
+    /// the app over iOS's memory limit.
+    static let largeItemThreshold: Int64 = 1_000_000_000
 
     func worker() -> UploadWorker {
         let exporter = self.exporter
         let client = self.client
+        let largeItemThreshold = Self.largeItemThreshold
         return { id, source, restoredCheckpoint, options, emit in
             let relay = UploadPhaseRelay(emit: emit)
             defer { relay.stop() }
@@ -109,10 +114,21 @@ struct PhotosUploader {
                !FileManager.default.fileExists(atPath: restoredCheckpoint.filePath) {
                 checkpoint = nil
                 await emit(.checkpoint(nil))
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "A saved upload copy was missing, so the item is being prepared again",
+                    level: .warning
+                )
             }
             if checkpoint == nil {
                 await emit(.state(.exporting))
                 let media = try await exporter.export(source, allowsNetworkAccess: options.allowsICloudDownload)
+                if media.byteCount >= largeItemThreshold {
+                    DiagnosticEventLog.shared.record(
+                        "upload",
+                        "Prepared a large item (\(DiagnosticProcessInfo.bytes(media.byteCount))) for upload; \(DiagnosticProcessInfo.memoryDescription())"
+                    )
+                }
                 checkpoint = UploadCheckpoint(
                     filePath: media.url.standardizedFileURL.path,
                     filename: media.filename,
@@ -172,6 +188,11 @@ struct PhotosUploader {
                     // retry through the same background transport again.
                     checkpoint.continuesAfterProcessExit = false
                     checkpoint.retriedAfterInvalidReceipt = true
+                    DiagnosticEventLog.shared.record(
+                        "upload",
+                        "Google returned an unusable upload receipt; this item will retry as a foreground upload, which only runs while the app is open",
+                        level: .warning
+                    )
                 }
                 await emit(.checkpoint(checkpoint))
                 throw error
@@ -200,8 +221,18 @@ struct PhotosUploader {
                 // re-uploading the bytes again would not fix it either.
                 guard checkpoint.retriedAfterInvalidReceipt != true else {
                     await emit(.checkpoint(checkpoint))
+                    DiagnosticEventLog.shared.record(
+                        "upload",
+                        "Google rejected an upload's finalization again after a fresh transfer, so the item was not retried further",
+                        level: .error
+                    )
                     throw GPMCError(kind: .malformed, message: error.message, status: error.status)
                 }
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Google rejected an upload's receipt at finalization; transferring the item again while the app is open",
+                    level: .warning
+                )
                 checkpoint.retriedAfterInvalidReceipt = true
                 await emit(.checkpoint(checkpoint))
                 throw error

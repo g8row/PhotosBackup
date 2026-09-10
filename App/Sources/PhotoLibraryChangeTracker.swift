@@ -41,7 +41,12 @@ final class PhotoLibraryChangeTracker {
         let context = ([accountIdentifier?.lowercased() ?? ""] + selectedAlbumIDs.sorted())
             .joined(separator: "\u{1F}")
         guard #available(iOS 16, *) else {
-            return Scan(sources: albums.sourcesSynchronously(for: selectedAlbumIDs))
+            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
+            DiagnosticEventLog.shared.record(
+                "library",
+                "Scanned the selected albums in full (iOS 15 keeps no change history): \(sources.count) items"
+            )
+            return Scan(sources: sources)
         }
 
         let library = PHPhotoLibrary.shared()
@@ -49,7 +54,15 @@ final class PhotoLibraryChangeTracker {
         let next = archive(current).map { StoredState(context: context, token: $0) }
         guard let stored = load(), stored.context == context,
               let token = unarchive(stored.token) else {
-            return Scan(sources: albums.sourcesSynchronously(for: selectedAlbumIDs), nextState: next)
+            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
+            let why = load() == nil
+                ? "no earlier scan to compare with"
+                : "the album selection or account changed since the last scan"
+            DiagnosticEventLog.shared.record(
+                "library",
+                "Scanned the selected albums in full (\(why)): \(sources.count) items"
+            )
+            return Scan(sources: sources, nextState: next)
         }
 
         do {
@@ -77,11 +90,23 @@ final class PhotoLibraryChangeTracker {
             let sources = selectedCollectionChanged
                 ? albums.sourcesSynchronously(for: selectedAlbumIDs)
                 : albums.sources(for: selectedAlbumIDs, matching: inserted.union(updated))
+            DiagnosticEventLog.shared.record(
+                "library",
+                selectedCollectionChanged
+                    ? "A selected album changed, so the selection was rescanned in full: \(sources.count) items"
+                    : "Read the library's change history: \(inserted.count) added, \(updated.count) edited; \(sources.count) in the selected albums"
+            )
             return Scan(sources: sources, editedSources: edited, nextState: next)
         } catch {
             // Expired/unavailable history requires one correctness-first current
             // scan, after which the fresh token becomes the new baseline.
-            return Scan(sources: albums.sourcesSynchronously(for: selectedAlbumIDs), nextState: next)
+            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
+            DiagnosticEventLog.shared.record(
+                "library",
+                "The library's change history was unavailable (\(error.localizedDescription)), so the selection was scanned in full: \(sources.count) items",
+                level: .warning
+            )
+            return Scan(sources: sources, nextState: next)
         }
     }
 
@@ -99,6 +124,11 @@ final class PhotoLibraryChangeTracker {
         } catch {
             // Keeping the prior token causes harmless re-enqueue attempts; the
             // queue's durable asset-key ledger removes duplicates.
+            DiagnosticEventLog.shared.record(
+                "library",
+                "Could not save the library scan position; the next scan repeats some work: \(error.localizedDescription)",
+                level: .warning
+            )
         }
     }
 

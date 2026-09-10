@@ -16,7 +16,8 @@ final class PhotosStack {
         self.account = account
         self.exporter = exporter
         self.queue = UploadQueue(worker: uploader.worker(), persistence: FileUploadQueuePersistence(),
-                                 checkpointCleaner: uploader.checkpointCleaner())
+                                 checkpointCleaner: uploader.checkpointCleaner(),
+                                 preparationMarkers: UserDefaultsPreparationMarkers())
         self.queue.onCredentialRejected = { [weak account] error in account?.report(error) }
     }
 
@@ -38,6 +39,9 @@ final class PhotosStack {
             await account.restore()
             queue.activateAccount(account.status.email)
             await exporter.purge(excluding: queue.retainedStagingURLs)
+            await BackgroundFileUploadTransport.shared.purgeResults(
+                excluding: queue.retainedTransferIDs
+            )
         }
         startTask = task
         await task.value

@@ -20,6 +20,7 @@ struct SettingsView: View {
             Form {
                 accountSection
                 backupSection
+                automationSection
                 verifySection
                 supportSection
                 aboutSection
@@ -134,7 +135,7 @@ struct SettingsView: View {
         } header: {
             Text("Backup")
         } footer: {
-            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. Live Photos currently back up as still images.")
+            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality. Live Photos currently back up as still images.")
         }
     }
 
@@ -163,6 +164,16 @@ struct SettingsView: View {
         }
     }
 
+    private var automationSection: some View {
+        Section {
+            ShortcutsSettingsRows()
+        } header: {
+            Text("Shortcuts")
+        } footer: {
+            Text("In the Shortcuts app, create a personal automation — when the iPhone connects to power, at a time of day, or when it joins your home Wi-Fi — set it to run immediately, and add Back Up Photos. Each run has about 30 seconds: it finds new photos in the selected albums and hands them to iOS to upload in the background. It runs even with Automatic Backup off, and still follows Use Connection and Pause. Photos stored only in iCloud wait until the app is open.")
+        }
+    }
+
     private var canVerify: Bool {
         account.status.isUsable && !isVerifying && !preferences.selectedAlbumIDs.isEmpty
     }
@@ -180,6 +191,8 @@ struct SettingsView: View {
 
     private var supportSection: some View {
         Section("Support") {
+            NavigationLink("Create Diagnostic Report") { DiagnosticReportView() }
+            NavigationLink("Storage") { StorageUsageView() }
             NavigationLink("Diagnostics") { DiagnosticsView() }
             Button("Run Onboarding Again") {
                 preferences.resetOnboarding()
@@ -220,6 +233,32 @@ struct SettingsView: View {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
         return "\(version) (\(build))"
+    }
+}
+
+/// The Shortcuts rows: a way into the Shortcuts app, and the last run, so an
+/// automation can be checked without waiting for a problem.
+private struct ShortcutsSettingsRows: View {
+    @State private var lastRun: AutomaticBackupRunRecord?
+
+    var body: some View {
+        Group {
+            if #available(iOS 16.0, *) {
+                Label("Back Up Photos action", systemImage: "square.stack.3d.up.fill")
+                Link("Open Shortcuts", destination: URL(string: "shortcuts://")!)
+                if let lastRun {
+                    AutomaticRunRow(run: lastRun)
+                } else {
+                    Text("The action has not run yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Label("Requires iOS 16 or later", systemImage: "info.circle")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { lastRun = AutomaticBackupRunHistory.latest(.shortcut) }
     }
 }
 

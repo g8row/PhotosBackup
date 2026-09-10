@@ -11,11 +11,26 @@ struct DiagnosticsView: View {
     @State private var manualToken = ""
     @State private var showAdvanced = false
     @State private var showingConnect = false
+    @State private var runs: [AutomaticBackupRunRecord] = []
 
     var body: some View {
         List {
             Section("Environment") {
                 LabeledRow("iOS", value: UIDevice.current.systemVersion)
+            }
+
+            Section {
+                if runs.isEmpty {
+                    Text("No backup run has been recorded yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(runs.prefix(12)) { run in AutomaticRunRow(run: run) }
+                }
+                NavigationLink("Event Timeline") { DiagnosticEventsView() }
+            } header: {
+                Text("Recent Runs")
+            } footer: {
+                Text("Every run, newest first: opening the app, Back Up Now, Shortcuts, and the background windows iOS grants. A background run shows when iOS actually started it.")
             }
 
 #if DEBUG
@@ -138,6 +153,7 @@ struct DiagnosticsView: View {
         }
         .navigationTitle("Diagnostics")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear { runs = AutomaticBackupRunHistory.recent() }
         .fullScreenCover(isPresented: $showingConnect) {
             AccountConnectView(
                 onCaptured: { token in

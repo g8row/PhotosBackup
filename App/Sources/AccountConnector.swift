@@ -47,9 +47,11 @@ final class AccountConnector: ObservableObject {
             let failedStep = f.stage == "photos token" ? ProbeLog.photosToken : ProbeLog.masterToken
             if failedStep == ProbeLog.photosToken { log.set(ProbeLog.masterToken, .passed) }
             log.set(failedStep, .failed, f.message)
+            DiagnosticEventLog.shared.record("account", "Sign-in failed while getting the \(f.stage): \(f.message)", level: .error)
             return
         } catch {
             log.set(ProbeLog.masterToken, .failed, error.localizedDescription)
+            DiagnosticEventLog.shared.record("account", "Sign-in failed: \(error.localizedDescription)", level: .error)
             return
         }
 
@@ -62,9 +64,15 @@ final class AccountConnector: ObservableObject {
 
         if result.encrypted {
             log.set(ProbeLog.readAccess, .skipped, "skipped: no usable access token")
+            DiagnosticEventLog.shared.record(
+                "account",
+                "Sign-in returned a device-bound token, which this app cannot use",
+                level: .error
+            )
             return
         }
 
+        DiagnosticEventLog.shared.record("account", "Sign-in completed and the Google token was exchanged")
         lastResult = result
         await onExchange?(result)
         await checkReadAccess(result)
@@ -87,8 +95,9 @@ final class AccountConnector: ObservableObject {
             try await client.validateReadAccess()
             log.set(ProbeLog.readAccess, .passed, "dummy hash lookup accepted by photosdata-pa")
         } catch {
-            log.set(ProbeLog.readAccess, .failed, (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription)
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            log.set(ProbeLog.readAccess, .failed, detail)
+            DiagnosticEventLog.shared.record("account", "The first read-only request after sign-in failed: \(detail)", level: .warning)
         }
     }
 
