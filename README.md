@@ -35,9 +35,18 @@ without a desktop companion or hosted service.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
   cancelling in-flight background transfers when the allowed transport is lost.
 - Request recurring iOS background-processing windows for selected-album backup.
+- Expose a **Back Up Photos** Shortcuts action on iOS 16+ for charger,
+  time-of-day, Wi-Fi, and other personal automations. It runs even with
+  Automatic Backup off, so a schedule of your choosing can replace it.
 - Keep file PUTs running in an iOS-owned background `URLSession`, then commit
   completed receipts when iOS relaunches the app.
 - Track PhotoKit persistent changes on iOS 16+ so backdated imports are found.
+- Keep going when one item keeps closing the app: an item the app stopped on
+  twice while preparing it is skipped, and can be retried, instead of stopping
+  every relaunch.
+- Create a privacy-safe diagnostic report with a plain-language summary, the
+  recent runs and the conditions iOS ran them under, crash and termination data
+  from iOS, and a timeline of what the app decided and why.
 - Store usable long-lived credentials in the iOS Keychain when signing permits.
 
 ## Current status
@@ -50,9 +59,9 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.3.5** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-132 tests run on an iPhone simulator: 130 pass, with 2 opt-in live tests
-skipped.
+Latest release: **0.3.6** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+161 tests run on an iPhone simulator: 158 pass. The 2 opt-in live tests and
+the Keychain round trip, which needs a signed build, are skipped.
 
 ### App identity (since 0.0.2)
 
@@ -66,6 +75,20 @@ skipped.
 > The bundle ID and Keychain service changed in 0.0.2. After updating from an
 > older build, reconnect the Google account once, then force-quit and reopen
 > to confirm it stays connected.
+
+## Reporting a problem
+
+Open **Settings → Support → Create Diagnostic Report**, tap **Generate
+Report**, then **Share or Save Report**. Attach the text file to a
+[GitHub issue](https://github.com/g8row/PhotosBackup/issues). The report
+opens with a short **What stands out** list that often explains the problem on
+its own. It leaves out credentials, account addresses, photo identifiers,
+filenames, media, and request URLs.
+
+**Diagnostics → Event Timeline** shows the same timeline inside the app. Crash
+details from iOS are included only when Share With App Developers is on
+(Settings → Privacy & Security → Analytics & Improvements); they arrive a day
+or so after the crash.
 
 ## Requirements
 
@@ -205,6 +228,9 @@ Android master token → Photos access token → private Photos API
   ignored.
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
+- Shortcuts can create extra backup opportunities on iOS 16+, but iOS gives
+  each run about 30 seconds. The action queues durable work and gives prepared
+  file transfers to the background URL session; it is not a periodic guarantee.
 - Background scans enqueue bounded batches of 250. The limit bounds memory, not
   how much a window uploads: the queue is durable, so whatever a window cannot
   finish waits for the next one. Foreground scans and the manual Back Up Now and
