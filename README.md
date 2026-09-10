@@ -169,6 +169,13 @@ tool re-signs it with the Apple ID configured on the device.
 Prebuilt unsigned IPAs are attached to each
 [GitHub release](https://github.com/g8row/PhotosBackup/releases).
 
+To get new versions automatically, add this source in SideStore, AltStore, or
+Feather. It is regenerated from every release:
+
+```text
+https://g8row.github.io/PhotosBackup/apps.json
+```
+
 > [!TIP]
 > On your iPhone (with SideStore or AltStore installed), one-tap install of
 > the latest release:
