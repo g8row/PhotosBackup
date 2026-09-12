@@ -1,0 +1,58 @@
+name: release-ipa
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and attach unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build unsigned IPA
+        run: Scripts/make-ipa.sh
+
+      - name: Checksum
+        run: |
+          shasum -a 256 build/PhotosBackup.ipa | awk '{print $1}' > build/PhotosBackup.ipa.sha256
+          echo "sha256: $(cat build/PhotosBackup.ipa.sha256)"
+
+      - name: Attach IPA and checksum to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            build/PhotosBackup.ipa build/PhotosBackup.ipa.sha256 --clobber
+          echo "Attached to release $GITHUB_REF_NAME"
+
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotosBackup-ipa
+          path: |
+            build/PhotosBackup.ipa
+            build/PhotosBackup.ipa.sha256
+          if-no-files-found: error
