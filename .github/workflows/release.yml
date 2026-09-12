@@ -1,0 +1,77 @@
+name: release-ipa
+
+# Builds the unsigned IPA in CI from the exact commit a release points at and
+# attaches it (plus its SHA-256) to the release. This closes the gap between
+# the published source and the shipped binary: the artifact users sideload is
+# the one GitHub Actions built from the tagged tree, not a local build.
+#
+# The build mirrors Scripts/make-ipa.sh exactly: xcodegen, xcodebuild with
+# signing disabled, zipped into Payload/. The script's pinned DEVELOPER_DIR
+# (/Applications/Xcode-16.4.0.app) does not exist on GitHub runners, so the
+# workflow exports the runner's copy of the same version first.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and attach unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # make-ipa.sh defaults to Xcode 16.4, the toolchain the releases so far
+      # were built with (DTXcodeBuild 16F6, iphoneos18.5 SDK). Runner images
+      # install it as Xcode_16.4.app; if a future image drops it, fall back to
+      # the image default and print what was used.
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build unsigned IPA
+        run: Scripts/make-ipa.sh
+
+      - name: Checksum
+        run: |
+          shasum -a 256 build/PhotosBackup.ipa | awk '{print $1}' > build/PhotosBackup.ipa.sha256
+          echo "sha256: $(cat build/PhotosBackup.ipa.sha256)"
+
+      # --clobber so a CI build replaces any manually attached asset with the
+      # same name: the release always carries the artifact this workflow built
+      # from the tagged commit.
+      - name: Attach IPA and checksum to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            build/PhotosBackup.ipa build/PhotosBackup.ipa.sha256 --clobber
+          echo "Attached to release $GITHUB_REF_NAME"
+
+      # Manual runs build the checked-out ref and expose the result as a
+      # workflow artifact, so the pipeline can be tested without publishing.
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotosBackup-ipa
+          path: |
+            build/PhotosBackup.ipa
+            build/PhotosBackup.ipa.sha256
+          if-no-files-found: error
