@@ -9,6 +9,8 @@ struct UploadOptions: Equatable, Sendable {
     /// Background processing must never spend its short CPU window downloading
     /// a cloud-only PhotoKit resource. Foreground work may opt back in.
     var allowsICloudDownload = true
+    /// Set per row from `UploadItem.forcesUpload`, never queue-wide.
+    var skipsDuplicateCheck = false
 }
 
 /// One row of the activity list.
@@ -81,6 +83,8 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     /// How many times the process died while this row was being prepared.
     /// See `UploadQueue.noteInterruptedPreparations`.
     var interruptedPreparations = 0
+    /// Uploads even when Google already holds the file. See `UploadQueue.reupload`.
+    var forcesUpload = false
 
     init(id: UUID = UUID(), source: MediaSource, name: String = "Preparing…") {
         self.id = id; self.source = source; self.name = name
@@ -406,14 +410,17 @@ final class UploadQueue: ObservableObject {
     }
 
     @discardableResult
-    func enqueue(_ sources: [MediaSource], skippingExisting: Bool = false, limit: Int? = nil) -> [UUID] {
-        enqueueReportingLimit(sources, skippingExisting: skippingExisting, limit: limit).accepted
+    func enqueue(_ sources: [MediaSource], skippingExisting: Bool = false, limit: Int? = nil,
+                 forcingUpload: Bool = false) -> [UUID] {
+        enqueueReportingLimit(sources, skippingExisting: skippingExisting, limit: limit,
+                              forcingUpload: forcingUpload).accepted
     }
 
     @discardableResult
     func enqueueReportingLimit(_ sources: [MediaSource],
                                skippingExisting: Bool = false,
-                               limit: Int? = nil) -> EnqueueOutcome {
+                               limit: Int? = nil,
+                               forcingUpload: Bool = false) -> EnqueueOutcome {
         var reachedLimit = false
         var accepted: [UploadItem] = []
         // A failed row is already the durable retry handle for its source, and
@@ -438,7 +445,9 @@ final class UploadQueue: ObservableObject {
                     if isAlreadyTracked || accepted.contains(where: { $0.source == source }) { continue }
                 }
             }
-            accepted.append(UploadItem(source: source))
+            var item = UploadItem(source: source)
+            item.forcesUpload = forcingUpload
+            accepted.append(item)
         }
         appendRows(accepted)
         persistNow()
@@ -689,6 +698,25 @@ final class UploadQueue: ObservableObject {
         return (forgotten, enqueued)
     }
 
+    /// Upload these sources again even where Google already holds the file,
+    /// for a user moving existing backups to the settings in force now.
+    /// Rows already tracked for a source are marked rather than duplicated.
+    /// Returns how many rows will upload.
+    @discardableResult
+    func reupload(_ sources: [MediaSource]) -> Int {
+        forgetCompletedSources(for: sources)
+        let keys = Set(sources.compactMap(\.queueDeduplicationKey))
+        var marked = 0
+        for index in items.indices where !items[index].forcesUpload && !items[index].state.isFinished {
+            guard let key = items[index].source.queueDeduplicationKey, keys.contains(key) else { continue }
+            items[index].forcesUpload = true
+            marked += 1
+        }
+        let enqueued = enqueue(sources, skippingExisting: true, forcingUpload: true).count
+        if marked > 0 { persistNow() }
+        return marked + enqueued
+    }
+
     /// Select and restore the durable queue for the connected account. A queue
     /// is never reused for a different Google account.
     func activateAccount(_ identifier: String?) {
@@ -743,6 +771,7 @@ final class UploadQueue: ObservableObject {
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
                 item.checkpoint = stored.checkpoint
+                item.forcesUpload = stored.forceUpload == true
                 item.interruptedPreparations = stored.interruptedPreparations ?? 0
                 if stored.cancelled == true {
                     item.state = .cancelled
@@ -967,7 +996,8 @@ final class UploadQueue: ObservableObject {
         }
         let source = items[index].source
         let checkpoint = items[index].checkpoint
-        let options = self.options
+        var options = self.options
+        options.skipsDuplicateCheck = items[index].forcesUpload
         let worker = self.worker
         running[id] = Task { [weak self] in
             let outcome: Result<UploadOutcome, Error>
@@ -1265,6 +1295,7 @@ final class UploadQueue: ObservableObject {
             let interruptions = item.interruptedPreparations > 0 ? item.interruptedPreparations : nil
             let motion: Bool? = item.source.isLivePhotoMotion ? true : nil
             let editBase: Bool? = item.source.isEditBase ? true : nil
+            let forceUpload: Bool? = item.forcesUpload ? true : nil
             switch item.state {
             case .alreadyBackedUp, .done:
                 return nil
@@ -1274,20 +1305,23 @@ final class UploadQueue: ObservableObject {
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: nil, failureRetryable: false,
-                                           checkpoint: nil, cancelled: true, motion: motion, editBase: editBase)
+                                           checkpoint: nil, cancelled: true, motion: motion, editBase: editBase,
+                                           forceUpload: forceUpload)
             case .failed(let reason, let retryable):
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: reason, failureRetryable: retryable,
                                            checkpoint: item.checkpoint,
-                                           interruptedPreparations: interruptions, motion: motion, editBase: editBase)
+                                           interruptedPreparations: interruptions, motion: motion, editBase: editBase,
+                                           forceUpload: forceUpload)
             default:
                 // Working and retry-delay states intentionally restore queued.
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: nil, failureRetryable: false,
                                            checkpoint: item.checkpoint,
-                                           interruptedPreparations: interruptions, motion: motion, editBase: editBase)
+                                           interruptedPreparations: interruptions, motion: motion, editBase: editBase,
+                                           forceUpload: forceUpload)
             }
         }
         let snapshot = UploadQueueSnapshot(
