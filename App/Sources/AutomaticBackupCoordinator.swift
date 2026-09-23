@@ -728,6 +728,35 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let summary: String
     }
 
+    /// The assets among those PhotoKit reports as changed whose backed-up file
+    /// may be stale. Forgetting every changed asset wiped the ledger: PhotoKit
+    /// reports far more changes than edits, and a window that hit the batch
+    /// limit left the change token where it was, so the next window forgot the
+    /// same assets again, including the ones re-checked in between. Before
+    /// iOS 18 there is no edit timestamp to tell them apart.
+    private func sourcesWithChangedContent(_ changed: [MediaSource]) -> [MediaSource] {
+        guard #available(iOS 18, *) else { return changed }
+        let identifiers = changed.compactMap { source -> String? in
+            if case .asset(let identifier) = source { return identifier }
+            return nil
+        }
+        var adjustedAt: [String: Date] = [:]
+        PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            adjustedAt[asset.localIdentifier] = asset.adjustmentTimestamp
+        }
+        let edited = changed.filter { source in
+            guard case .asset(let identifier) = source else { return true }
+            return queue.needsRecheck(assetIdentifier: identifier, adjustedAt: adjustedAt[identifier])
+        }
+        if edited.count < changed.count {
+            DiagnosticEventLog.shared.record(
+                "library",
+                "\(changed.count - edited.count) of \(changed.count) changed items were not edited since their backup, so they stay backed up"
+            )
+        }
+        return edited
+    }
+
     /// Scan, queue, and wait for what can finish.
     ///
     /// - Parameters:
@@ -775,7 +804,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // the worker's hash lookup still short-circuits anything whose bytes
         // did not actually change.
         if !scan.editedSources.isEmpty {
-            queue.forgetCompletedSources(for: scan.editedSources)
+            queue.forgetCompletedSources(for: sourcesWithChangedContent(scan.editedSources))
         }
         let outcome = queue.enqueueReportingLimit(scan.sources, skippingExisting: true,
                                                   limit: Self.backgroundBatchLimit)

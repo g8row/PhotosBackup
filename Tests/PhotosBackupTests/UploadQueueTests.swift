@@ -44,6 +44,7 @@ private extension NSLock {
     func sync<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }
 
+
 /// A queue sleeper that records each requested delay and holds every sleeper
 /// until the test opens it.
 final class SleepGate: @unchecked Sendable {
@@ -693,6 +694,75 @@ final class UploadQueueTests: XCTestCase {
         restored.activateAccount("person@gmail.com")
         XCTAssertEqual(restored.items.map(\.source), [.editBase(localIdentifier: "edited-1"),
                                                       .livePhotoMotion(localIdentifier: "live-1")])
+    }
+
+    /// A worker shaped like the real one when the duplicate check finds the
+    /// file: it stages a checkpoint, drops it, then settles the row.
+    private func alreadyBackedUpWorker(adjustedAt: Date?) -> UploadWorker {
+        { _, _, _, _, emit in
+            await emit(.checkpoint(UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                                    modified: Date(timeIntervalSince1970: 100), byteCount: 123,
+                                                    temporary: true, prepared: nil, adjustedAt: adjustedAt)))
+            await emit(.checkpoint(nil))
+            return .alreadyBackedUp(mediaKey: "KEY")
+        }
+    }
+
+    /// A background window runs in a fresh process, so the edit a backup
+    /// carried has to survive a relaunch for the next scan to tell a real edit
+    /// from any other library change.
+    func testTheEditAnAssetWasBackedUpWithSurvivesRelaunch() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let persistence = FileUploadQueuePersistence(url: directory.appendingPathComponent("queue.json"))
+        let edited = Date(timeIntervalSince1970: 1_790_000_000.25)
+        let first = UploadQueue(worker: alreadyBackedUpWorker(adjustedAt: edited), maxConcurrent: 1,
+                                persistence: persistence)
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        await settle(first) { first.items.first?.state == .alreadyBackedUp }
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        XCTAssertFalse(restored.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited))
+        XCTAssertTrue(restored.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited.addingTimeInterval(60)))
+        XCTAssertEqual(restored.completedSourceCount, 1)
+    }
+
+    /// An asset that was never edited uploads its original, which a library
+    /// change cannot alter, so it is never re-checked.
+    func testANeverEditedAssetIsNotRechecked() async {
+        let queue = UploadQueue(worker: alreadyBackedUpWorker(adjustedAt: nil), maxConcurrent: 1)
+        queue.enqueue([.asset(localIdentifier: "asset-1")])
+        await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
+        XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", adjustedAt: nil))
+        XCTAssertEqual(queue.completedSourceKeys, ["asset:asset-1"])
+    }
+
+    /// A row restored mid-preparation keeps the edit its checkpoint recorded,
+    /// even though the worker drops the checkpoint before settling the row.
+    func testARestoredRowRecordsTheEditItsCheckpointCarried() async {
+        let edited = Date(timeIntervalSince1970: 1_790_000_000)
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                          modified: Date(timeIntervalSince1970: 100), byteCount: 123,
+                                          temporary: true, prepared: nil, adjustedAt: edited)
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version, accountIdentifier: "person@gmail.com",
+            items: [PersistedUploadItem(id: UUID(), source: .asset("asset-1"), name: "IMG.JPG", byteCount: 123,
+                                        attempts: 1, failureReason: nil, failureRetryable: false,
+                                        checkpoint: checkpoint)],
+            completedSourceKeys: []
+        ))
+        let resumingWorker: UploadWorker = { _, _, _, _, emit in
+            await emit(.checkpoint(nil))
+            return .alreadyBackedUp(mediaKey: "KEY")
+        }
+        let queue = UploadQueue(worker: resumingWorker, maxConcurrent: 1, persistence: persistence)
+        queue.activateAccount("person@gmail.com")
+        await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
+        XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited))
     }
 
     func testAMotionCheckpointKeepsItsStillHash() throws {

@@ -43,6 +43,8 @@ struct UploadCheckpoint: Codable, Equatable, Sendable {
     var retriedAfterInvalidReceipt: Bool? = nil
     /// For a Live Photo motion: SHA-1 of the still it is committed onto.
     var pairedStillHash: Data? = nil
+    /// The exported asset's `adjustmentTimestamp`. See `ExportedMedia.adjustedAt`.
+    var adjustedAt: Date? = nil
 
     var fileURL: URL { URL(fileURLWithPath: filePath) }
     var isBackgroundTransfer: Bool { prepared != nil && continuesAfterProcessExit == true }
