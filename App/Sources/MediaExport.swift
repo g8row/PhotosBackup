@@ -49,6 +49,9 @@ struct ExportedMedia: Equatable, Sendable {
     /// For a Live Photo motion: SHA-1 of the still the motion belongs to, the
     /// dedup key of the item it is attached to.
     var pairedStillHash: Data? = nil
+    /// For a library asset on iOS 18 and later: its `adjustmentTimestamp` as
+    /// read before the file was copied. Nil when it was never edited.
+    var adjustedAt: Date? = nil
 }
 
 /// Turns a `MediaSource` into a file `GPMCClient.upload` can read, and cleans
@@ -214,7 +217,13 @@ actor MediaExporter {
         }
         let original = resources.first { $0.type == .photo || $0.type == .video }?.originalFilename
         let filename = Self.uploadFilename(original: original, rendition: resource.originalFilename)
-        return try await stage(resource, as: filename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
+        // Read before the copy: an edit landing mid-copy then leaves the older
+        // timestamp on record, so the next scan re-checks the asset.
+        var adjustedAt: Date?
+        if #available(iOS 18, *) { adjustedAt = asset.adjustmentTimestamp }
+        var media = try await stage(resource, as: filename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
+        media.adjustedAt = adjustedAt
+        return media
     }
 
     /// The format the Google Photos app records its own edits in.

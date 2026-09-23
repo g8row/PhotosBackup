@@ -81,6 +81,10 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     /// How many times the process died while this row was being prepared.
     /// See `UploadQueue.noteInterruptedPreparations`.
     var interruptedPreparations = 0
+    /// The exported asset's `adjustmentTimestamp`. Kept here as well as on the
+    /// checkpoint because a row the duplicate check settles drops its
+    /// checkpoint before it finishes.
+    var adjustedAt: Date?
 
     init(id: UUID = UUID(), source: MediaSource, name: String = "Preparing…") {
         self.id = id; self.source = source; self.name = name
@@ -621,7 +625,37 @@ final class UploadQueue: ObservableObject {
     var completedSourceCount: Int {
         completedSourceKeys.count - completedSourceKeys.lazy.filter {
             $0.hasPrefix(Self.motionKeyPrefix) || $0.hasPrefix(Self.editBaseKeyPrefix)
+                || $0.hasPrefix(Self.editStateKeyPrefix)
         }.count
+    }
+
+    /// Ledger prefix of the edit an asset carried when it was backed up: its
+    /// identifier and `adjustmentTimestamp`. See `needsRecheck`.
+    nonisolated static let editStateKeyPrefix = "edited:"
+
+    nonisolated static func editStateKey(assetIdentifier: String, adjustedAt: Date) -> String {
+        editStateKeyPrefix + assetIdentifier + "@"
+            + String(Int64((adjustedAt.timeIntervalSince1970 * 1000).rounded()))
+    }
+
+    /// Whether an asset PhotoKit reports as changed may no longer match its
+    /// backup. PhotoKit also reports favourites, album moves and its own photo
+    /// analysis as changes, and those leave the file alone. Only an edit or a
+    /// revert changes what is uploaded, and each one moves the timestamp. A
+    /// never-edited asset uploads its original, which does not change.
+    func needsRecheck(assetIdentifier: String, adjustedAt: Date?) -> Bool {
+        guard let adjustedAt else { return false }
+        return !completedSourceKeys.contains(Self.editStateKey(assetIdentifier: assetIdentifier, adjustedAt: adjustedAt))
+    }
+
+    /// The ledger keys a finished row records: its source, plus the edit it
+    /// carried when it is a library asset that has one.
+    private func completionKeys(for item: UploadItem) -> [String] {
+        var keys = item.source.queueDeduplicationKey.map { [$0] } ?? []
+        if case .asset(let identifier) = item.source, let adjustedAt = item.adjustedAt {
+            keys.append(Self.editStateKey(assetIdentifier: identifier, adjustedAt: adjustedAt))
+        }
+        return keys
     }
 
     /// Ledger prefix of a Google Photos edit's base version, keyed by asset.
@@ -743,6 +777,7 @@ final class UploadQueue: ObservableObject {
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
                 item.checkpoint = stored.checkpoint
+                item.adjustedAt = stored.checkpoint?.adjustedAt
                 item.interruptedPreparations = stored.interruptedPreparations ?? 0
                 if stored.cancelled == true {
                     item.state = .cancelled
@@ -992,6 +1027,7 @@ final class UploadQueue: ObservableObject {
             setState(state, at: index)
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
+            if let checkpoint { items[index].adjustedAt = checkpoint.adjustedAt }
             if checkpoint?.prepared != nil { clearPreparationMarker(id) }
             // The durable hand-off to the background transfer: this must be on
             // disk before the worker proceeds, not on the next turn.
@@ -1009,7 +1045,7 @@ final class UploadQueue: ObservableObject {
             let settled: UploadItem.State = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
             items[index].mediaKey = result.mediaKey
             setState(settled, at: index)
-            if let key = items[index].source.queueDeduplicationKey { completedSourceKeys.insert(key) }
+            completedSourceKeys.formUnion(completionKeys(for: items[index]))
             rateLimitDelay = Self.rateLimitBaseDelay
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
@@ -1312,11 +1348,11 @@ final class UploadQueue: ObservableObject {
     }
 
     private func recordCompletion(for item: UploadItem) {
-        guard let accountIdentifier, let persistence,
-              let key = item.source.queueDeduplicationKey,
+        let keys = completionKeys(for: item)
+        guard let accountIdentifier, let persistence, !keys.isEmpty,
               persistence.storesCompletionLedgerSeparately else { return }
         do {
-            try persistence.recordCompletedSourceKey(key, for: accountIdentifier)
+            try persistence.recordCompletedSourceKeys(keys, for: accountIdentifier)
         } catch {
             completionLedgerHealthy = false
             persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
