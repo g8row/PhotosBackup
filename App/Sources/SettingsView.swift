@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var connectionCheckResult: PhotosAccount.VerificationOutcome?
     @State private var verifyMessage: String?
     @State private var isVerifying = false
+    @State private var confirmReupload = false
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
 
     var body: some View {
@@ -152,6 +153,15 @@ struct SettingsView: View {
                 }
             }
             .disabled(!canVerify)
+            Button("Re-upload Selected Albums") { confirmReupload = true }
+                .disabled(!canVerify)
+                .confirmationDialog("Upload the selected albums again?", isPresented: $confirmReupload,
+                                    titleVisibility: .visible) {
+                    Button("Re-upload") { runReupload() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Every photo and video in the selected albums is uploaded again, including ones already in Google Photos. This takes as long and uses as much data as the first backup.")
+                }
             if let verifyMessage {
                 Text(verifyMessage)
                     .font(.footnote)
@@ -161,7 +171,7 @@ struct SettingsView: View {
         } header: {
             Text("Re-check")
         } footer: {
-            Text("Compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
+            Text("Re-check compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.\n\nRe-upload sends every item again using your current Storage Saver and storage quota settings. Google Photos may keep the copy it already has.")
         }
     }
 
@@ -185,6 +195,17 @@ struct SettingsView: View {
         verifyMessage = nil
         Task {
             let outcome = await automaticBackup.reverifySelectedAlbums()
+            isVerifying = false
+            verifyMessage = DashboardView.message(for: outcome)
+        }
+    }
+
+    private func runReupload() {
+        guard canVerify else { return }
+        isVerifying = true
+        verifyMessage = nil
+        Task {
+            let outcome = await automaticBackup.reuploadSelectedAlbums()
             isVerifying = false
             verifyMessage = DashboardView.message(for: outcome)
         }

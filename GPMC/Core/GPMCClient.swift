@@ -420,12 +420,17 @@ actor GPMCClient {
 
     /// Hash and de-duplicate while the app is awake, then obtain the resumable
     /// upload URL. No long-running body transfer happens in this method.
-    func prepareUpload(file: URL, filename: String, modified: Date? = nil,
+    ///
+    /// `skippingDuplicateCheck` uploads and commits even bytes the account
+    /// already holds, for a user who asked to upload them again.
+    func prepareUpload(file: URL, filename: String, modified: Date? = nil, skippingDuplicateCheck: Bool = false,
                        phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadPreparation {
         let (hash, size) = try hashFile(file, phase: phase)
-        phase(.checkingDuplicate)
-        if let key = try await remoteMediaKey(sha1: hash) {
-            return .alreadyBackedUp(mediaKey: key)
+        if !skippingDuplicateCheck {
+            phase(.checkingDuplicate)
+            if let key = try await remoteMediaKey(sha1: hash) {
+                return .alreadyBackedUp(mediaKey: key)
+            }
         }
         return .ready(try await startUploadSession(file: file, filename: filename, modified: modified,
                                                    hash: hash, size: size, phase: phase))

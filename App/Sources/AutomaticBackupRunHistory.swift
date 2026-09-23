@@ -4,6 +4,7 @@ enum AutomaticBackupRunSource: String, Codable, Sendable {
     case foreground = "App open"
     case manual = "Back Up Now"
     case recheck = "Re-check Backups"
+    case reupload = "Re-upload Selected Albums"
     case backgroundProcessing = "iOS background processing"
     case shortcut = "Shortcuts automation"
     case backgroundTransfer = "Background transfer completion"
@@ -13,7 +14,7 @@ enum AutomaticBackupRunSource: String, Codable, Sendable {
     /// Runs the user started by opening the app or tapping a button. They are
     /// the most frequent and say the least about background behaviour, so they
     /// are the first to go when the history is trimmed.
-    var isUserStarted: Bool { self == .foreground || self == .manual || self == .recheck }
+    var isUserStarted: Bool { self == .foreground || self == .manual || self == .recheck || self == .reupload }
 }
 
 struct AutomaticBackupRunRecord: Codable, Equatable, Identifiable, Sendable {

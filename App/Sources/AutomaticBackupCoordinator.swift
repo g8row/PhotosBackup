@@ -568,6 +568,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         case nothingToDo
         case started(count: Int)
         case rechecking(count: Int)
+        case reuploading(count: Int)
     }
 
     /// "Back Up Now". Queues the entire selection, so the count reported back is
@@ -609,6 +610,23 @@ final class AutomaticBackupCoordinator: ObservableObject {
         return .rechecking(count: total)
     }
 
+    /// "Re-upload Selected Albums". Uploads the selection again even where
+    /// Google already holds the files, so existing backups are committed under
+    /// the storage settings in force now.
+    func reuploadSelectedAlbums() async -> ManualRunOutcome {
+        guard !preferences.selectedAlbumIDs.isEmpty else { return noteManual(.reupload, .noAlbumsSelected) }
+        await albums.refresh()
+        guard albums.canRead else { return noteManual(.reupload, .noLibraryAccess) }
+        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        guard !sources.isEmpty else { return noteManual(.reupload, .nothingToDo) }
+        // Same reason as Re-check: a failed row would otherwise block its source.
+        queue.retryRetryableFailures()
+        let total = queue.reupload(sources)
+        guard total > 0 else { return noteManual(.reupload, .nothingToDo) }
+        startForegroundRun(sources, source: .reupload)
+        return .reuploading(count: total)
+    }
+
     /// Log a manual run that did not start, with the reason the user was shown.
     private func noteManual(_ source: AutomaticBackupRunSource, _ outcome: ManualRunOutcome) -> ManualRunOutcome {
         let reason: String
@@ -616,7 +634,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         case .noAlbumsSelected: reason = "no albums are selected"
         case .noLibraryAccess: reason = "the photo library cannot be read (\(DiagnosticReportBuilder.photoAuthorization()))"
         case .nothingToDo: reason = "everything selected is already backed up or queued"
-        case .started, .rechecking: return outcome
+        case .started, .rechecking, .reuploading: return outcome
         }
         DiagnosticEventLog.shared.record(
             "run",

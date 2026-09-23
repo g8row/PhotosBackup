@@ -178,7 +178,8 @@ struct PhotosUploader {
                 } else {
                     preparation = try await client.prepareUpload(
                         file: checkpoint.fileURL, filename: checkpoint.filename,
-                        modified: checkpoint.modified, phase: report)
+                        modified: checkpoint.modified, skippingDuplicateCheck: options.skipsDuplicateCheck,
+                        phase: report)
                 }
                 await relay.flush()
                 switch preparation {
