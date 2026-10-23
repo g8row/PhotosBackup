@@ -404,6 +404,11 @@ actor GPMCClient {
     // photosdata-pa method ids (gotohp @ 0637c745, backend/api.go).
     private static let hashCheckMethod = "5084965799730810217"
     private static let commitMethod = "16538846908252377752"
+    // Album calls (gotohp core/api.go CreateAlbum, AddMediaToAlbum). The
+    // private API has no known album lookup, so callers keep their own
+    // name -> album key record (`GoogleAlbumRegistry`).
+    private static let createAlbumMethod = "8386163679468898444"
+    private static let addToAlbumMethod = "484917746253879292"
     /// Only some photosdata-pa calls carry these. `doCommitRequest`,
     /// `CreateAlbum` and `AddMediaToAlbum` set them upstream;
     /// `FindRemoteMediaByHash` deliberately does not, and sending them on the
@@ -412,10 +417,40 @@ actor GPMCClient {
         "x-goog-ext-173412678-bin": "CgcIAhClARgC",
         "x-goog-ext-174067345-bin": "CgIIAg==",
     ]
-    private func rpc(_ method: String, body: Data, ext: Bool = false) async throws -> Data {
+    private func rpc(_ method: String, body: Data, ext: Bool = false, operation: String? = nil) async throws -> Data {
         try await request(URL(string: "https://photosdata-pa.googleapis.com/6439526531001121323/" + method)!,
                           body: body, headers: ext ? Self.extHeaders : [:],
-                          operation: method == Self.commitMethod ? "finalization" : "duplicate check").0
+                          operation: operation ?? (method == Self.commitMethod ? "finalization" : "duplicate check")).0
+    }
+
+    /// The upload device the commit and album calls declare: field 3 model,
+    /// 4 make, 5 Android API level.
+    static func deviceInfo(model: String) -> Data {
+        Proto.string(3, model) + Proto.string(4, "Google") + Proto.int(5, 28)
+    }
+
+    /// Create an album holding `mediaKeys` and return its album media key.
+    /// Field layout from gotohp generated/CreateAlbum.pb.go.
+    func createAlbum(named name: String, mediaKeys: [String], model: String) async throws -> String {
+        let now = UInt64(max(0, Date().timeIntervalSince1970))
+        var body = Proto.string(1, name) + Proto.int(2, now) + Proto.int(3, 1)
+        for key in mediaKeys { body += Proto.bytes(4, Proto.bytes(1, Proto.string(1, key))) }
+        body += Proto.bytes(6, Data()) + Proto.bytes(7, Proto.int(1, 3)) + Proto.bytes(8, Self.deviceInfo(model: model))
+        let response = try await rpc(Self.createAlbumMethod, body: body, ext: true, operation: "album creation")
+        guard let albumKey = try Proto.string(at: [1, 1], in: response) else {
+            throw GPMCError(message: "Google did not return a key for the new album \"\(name)\".")
+        }
+        return albumKey
+    }
+
+    /// Add `mediaKeys` to an existing album.
+    /// Field layout from gotohp generated/AddMediaToAlbum.pb.go.
+    func addMediaToAlbum(_ albumKey: String, mediaKeys: [String], model: String) async throws {
+        var body = Data()
+        for key in mediaKeys { body += Proto.string(1, key) }
+        body += Proto.string(2, albumKey) + Proto.bytes(5, Proto.int(1, 2)) + Proto.bytes(6, Self.deviceInfo(model: model))
+            + Proto.int(7, UInt64(max(0, Date().timeIntervalSince1970)))
+        _ = try await rpc(Self.addToAlbumMethod, body: body, ext: true, operation: "adding to an album")
     }
 
     /// Hash and de-duplicate while the app is awake, then obtain the resumable
@@ -595,7 +630,7 @@ actor GPMCClient {
         if let pairedStillHash {
             metadata += Proto.bytes(9, Proto.int(2, 1) + Proto.bytes(3, pairedStillHash))
         }
-        let device = Proto.string(3, profile.model) + Proto.string(4, "Google") + Proto.int(5, 28)
+        let device = Self.deviceInfo(model: profile.model)
         let committed: Data
         do {
             committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)

@@ -825,6 +825,70 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertTrue(String(decoding: asOriginal.device, as: UTF8.self).contains("Pixel XL"))
     }
 
+    // MARK: - Albums
+
+    /// CreateAlbum / AddMediaToAlbum field layouts, the same assertions the
+    /// desktop app's test/album-test.js makes against gotohp's messages.
+    func testAlbumCallsSendGotohpsFieldLayoutWithTheExtensionHeaders() async throws {
+        StubProtocol.handler = { request in
+            if request.stubPath == "/auth" { return .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n") }
+            if request.stubPath.hasSuffix("/8386163679468898444") {
+                return .ok(Proto.bytes(1, Proto.string(1, "AF1QipAlbum")))
+            }
+            return .ok(Data())
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+
+        let key = try await client.createAlbum(named: "Trip 2024", mediaKeys: ["mk1", "mk2"], model: "Pixel 8")
+        XCTAssertEqual(key, "AF1QipAlbum")
+        let create = try XCTUnwrap(StubProtocol.seen.first { $0.stubPath.hasSuffix("/8386163679468898444") })
+        XCTAssertEqual(create.value(forHTTPHeaderField: "x-goog-ext-174067345-bin"), "CgIIAg==")
+        let createBody = Self.body(of: create)
+        let c = try Proto.fields(createBody)
+        XCTAssertEqual(c[1]?.first.map { String(decoding: $0, as: UTF8.self) }, "Trip 2024")
+        XCTAssertGreaterThan(try XCTUnwrap(Proto.number(2, in: createBody)), 0)
+        XCTAssertEqual(try Proto.number(3, in: createBody), 1)
+        XCTAssertEqual(try c[4]?.map { try Proto.string(at: [1, 1], in: $0) }, ["mk1", "mk2"])
+        XCTAssertEqual(c[6]?.first, Data())
+        XCTAssertEqual(try Proto.number(1, in: try XCTUnwrap(c[7]?.first)), 3)
+        let createDevice = try XCTUnwrap(c[8]?.first)
+        XCTAssertEqual(try Proto.string(at: [3], in: createDevice), "Pixel 8")
+        XCTAssertEqual(try Proto.string(at: [4], in: createDevice), "Google")
+        XCTAssertEqual(try Proto.number(5, in: createDevice), 28)
+
+        try await client.addMediaToAlbum("AF1QipAlbum", mediaKeys: ["mk3"], model: "Pixel XL")
+        let add = try XCTUnwrap(StubProtocol.seen.first { $0.stubPath.hasSuffix("/484917746253879292") })
+        XCTAssertEqual(add.value(forHTTPHeaderField: "x-goog-ext-173412678-bin"), "CgcIAhClARgC")
+        let addBody = Self.body(of: add)
+        let a = try Proto.fields(addBody)
+        XCTAssertEqual(a[1]?.map { String(decoding: $0, as: UTF8.self) }, ["mk3"])
+        XCTAssertEqual(a[2]?.first.map { String(decoding: $0, as: UTF8.self) }, "AF1QipAlbum")
+        XCTAssertEqual(try Proto.number(1, in: try XCTUnwrap(a[5]?.first)), 2)
+        XCTAssertEqual(try Proto.string(at: [3], in: try XCTUnwrap(a[6]?.first)), "Pixel XL")
+        XCTAssertGreaterThan(try XCTUnwrap(Proto.number(7, in: addBody)), 0)
+    }
+
+    func testAnAlbumCreationWithoutAKeyIsMalformed() async throws {
+        StubProtocol.handler = { request in
+            request.stubPath == "/auth" ? .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n") : .ok(Data())
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        await XCTAssertThrowsGPMC(kind: .malformed) {
+            _ = try await client.createAlbum(named: "X", mediaKeys: ["mk"], model: "Pixel XL")
+        }
+    }
+
+    func testAlbumRegistryIsPerAccountAndForgetsOnANilKey() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = GoogleAlbumRegistry(directory: directory)
+        try registry.save("AF1QipA", named: "Trip", for: "Person@Gmail.com")
+        XCTAssertEqual(registry.albumKey(named: "Trip", for: "person@gmail.com"), "AF1QipA")
+        XCTAssertNil(registry.albumKey(named: "Trip", for: "other@gmail.com"))
+        try registry.save(nil, named: "Trip", for: "person@gmail.com")
+        XCTAssertNil(registry.albumKey(named: "Trip", for: "person@gmail.com"))
+    }
+
 }
 
 // MARK: - Helpers

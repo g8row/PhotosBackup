@@ -9,6 +9,9 @@ struct UploadOptions: Equatable, Sendable {
     /// Background processing must never spend its short CPU window downloading
     /// a cloud-only PhotoKit resource. Foreground work may opt back in.
     var allowsICloudDownload = true
+    /// File each library photo into a Google Photos album named after every
+    /// iOS album holding it, creating the album the first time.
+    var filesIntoAlbums = false
 }
 
 /// One row of the activity list.
@@ -22,6 +25,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
         case checkingDuplicate
         case uploading(fraction: Double)
         case finalizing
+        case addingToAlbum
         case alreadyBackedUp
         case done
         case cancelled
@@ -35,7 +39,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
         }
         var isWorking: Bool {
             switch self {
-            case .exporting, .hashing, .checkingDuplicate, .uploading, .finalizing: return true
+            case .exporting, .hashing, .checkingDuplicate, .uploading, .finalizing, .addingToAlbum: return true
             default: return false
             }
         }
@@ -46,6 +50,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             case .checkingDuplicate: return 0.1
             case .uploading(let f): return 0.1 + f * 0.85
             case .finalizing: return 0.95
+            case .addingToAlbum: return 0.98
             case .alreadyBackedUp, .done: return 1
             default: return nil
             }
@@ -60,6 +65,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             case .checkingDuplicate: return "Looking for a copy"
             case .uploading: return "Uploading"
             case .finalizing: return "Finishing"
+            case .addingToAlbum: return "Adding to album"
             case .alreadyBackedUp: return "Already backed up"
             case .done: return "Backed up"
             // Only ever the user's own doing now, so it says so: "Cancelled"
@@ -109,6 +115,7 @@ private extension MediaSource {
         case .picked: return nil
         case .livePhotoMotion(let identifier): return UploadQueue.motionKeyPrefix + identifier
         case .editBase(let identifier): return UploadQueue.editBaseKeyPrefix + identifier
+        case .folderFile(let folderID, let relativePath): return "folder:\(folderID)/\(relativePath)"
         }
     }
 
@@ -1174,6 +1181,7 @@ final class UploadQueue: ObservableObject {
         case .checkingDuplicate: return "asking Google for an existing copy"
         case .uploading: return "uploading"
         case .finalizing: return "finishing it in Google Photos"
+        case .addingToAlbum: return "adding it to its album"
         default: return "starting"
         }
     }

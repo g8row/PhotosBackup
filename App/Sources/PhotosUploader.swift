@@ -94,6 +94,9 @@ struct PhotosUploader {
     /// Resolved per item rather than captured, so a reconnect swaps the client
     /// under a queue that is already running.
     let client: @Sendable () async -> GPMCClient?
+    /// Shared by every item this worker runs, so concurrent uploads from one
+    /// iOS album wait on a single album creation.
+    let albums = GoogleAlbumFiler()
     /// Items at least this large are noted in the diagnostic log together with
     /// the memory available, since a large video is the likeliest thing to push
     /// the app over iOS's memory limit.
@@ -103,7 +106,8 @@ struct PhotosUploader {
         let exporter = self.exporter
         let client = self.client
         let largeItemThreshold = Self.largeItemThreshold
-        return { id, source, restoredCheckpoint, options, emit in
+        let albums = self.albums
+        let upload: UploadWorker = { id, source, restoredCheckpoint, options, emit in
             let relay = UploadPhaseRelay(emit: emit)
             defer { relay.stop() }
             guard let client = await client() else {
@@ -268,6 +272,32 @@ struct PhotosUploader {
             await client.forgetTransfer(id)
             await exporter.discard(checkpoint.exportedMedia)
             await emit(.checkpoint(nil))
+            return outcome
+        }
+        return { id, source, restoredCheckpoint, options, emit in
+            let outcome = try await upload(id, source, restoredCheckpoint, options, emit)
+            // Filed before the item counts as backed up: if this fails the
+            // item is retried, and the retry's hash lookup finds the copy
+            // already uploaded and files that.
+            guard options.filesIntoAlbums, !outcome.mediaKey.isEmpty else { return outcome }
+            let names: [String]
+            switch source {
+            case .asset(let identifier):
+                names = GoogleAlbumFiler.localAlbumNames(forAssetIdentifier: identifier)
+            case .folderFile(let folderID, let relativePath):
+                names = PickedFolderStore.shared.albumName(folderID: folderID, relativePath: relativePath).map { [$0] } ?? []
+            default:
+                return outcome
+            }
+            guard !names.isEmpty, let client = await client() else { return outcome }
+            await emit(.state(.addingToAlbum))
+            let account = await client.accountEmail
+            let model = GPMCClient.commitProfile(useQuota: options.useQuota, saver: options.storageSaver).model
+            for name in names {
+                try Task.checkCancellation()
+                try await albums.file(outcome.mediaKey, intoAlbumNamed: name, account: account,
+                                      client: client, model: model)
+            }
             return outcome
         }
     }

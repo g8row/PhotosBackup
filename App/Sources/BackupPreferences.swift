@@ -33,6 +33,7 @@ final class BackupPreferences: ObservableObject {
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
         static let backUpLivePhotoMotion = "backup.livePhotoMotion"
+        static let albumsFromLibrary = "backup.albumsFromLibrary"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -43,6 +44,7 @@ final class BackupPreferences: ObservableObject {
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
     @Published var backUpLivePhotoMotion: Bool { didSet { defaults.set(backUpLivePhotoMotion, forKey: Key.backUpLivePhotoMotion) } }
+    @Published var albumsFromLibrary: Bool { didSet { defaults.set(albumsFromLibrary, forKey: Key.albumsFromLibrary) } }
 
     private let defaults: UserDefaults
 
@@ -62,6 +64,9 @@ final class BackupPreferences: ObservableObject {
         // Photo already backed up, a few MB each, which an update should not
         // start on its own.
         backUpLivePhotoMotion = defaults.bool(forKey: Key.backUpLivePhotoMotion)
+        // Off until asked for, like motion: it creates albums in the user's
+        // Google account, which an update should not start doing on its own.
+        albumsFromLibrary = defaults.bool(forKey: Key.albumsFromLibrary)
     }
 
     func toggle(albumID: String) {

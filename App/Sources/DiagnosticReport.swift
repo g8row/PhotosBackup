@@ -384,6 +384,7 @@ enum DiagnosticReportBuilder {
         case .checkingDuplicate: return "duplicate-check"
         case .uploading: return "uploading"
         case .finalizing: return "finalizing"
+        case .addingToAlbum: return "adding-to-album"
         case .alreadyBackedUp: return "already-backed-up"
         case .done: return "done"
         case .cancelled: return "cancelled"
