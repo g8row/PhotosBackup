@@ -32,6 +32,8 @@ without a desktop companion or hosted service.
 - Show per-album backup progress, and re-upload assets edited after backup.
 - Back up an edited photo as it looks on the iPhone, the file the Google Photos
   app would upload itself, so Google Photos' Free up space recognises it.
+- Back up an edited video's original as well as its edit, including Cinematic
+  videos, which the camera saves as edited, so the Google Photos app counts them.
 - With Back Up Live Photo Motion on, back up a Live Photo with its motion
   attached, so it plays as a Live Photo and the Google Photos app's Free up
   space offers it. Live Photos backed up as a still earlier get their motion

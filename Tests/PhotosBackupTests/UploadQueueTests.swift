@@ -673,6 +673,27 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertTrue(queue.completedSourceKeys.contains(UploadQueue.editBaseKeyPrefix + "edited-1"))
     }
 
+    /// An edited video also backs up its original, which adds to a video already
+    /// counted, and the row restores as one.
+    func testAnEditedVideoQueuesItsOriginalWithoutCountingIt() async {
+        let queue = makeQueue(WorkerScript([]), maxConcurrent: 1)
+        queue.followUpSources = { source in
+            guard case .asset(let identifier) = source else { return [] }
+            return [.videoOriginal(localIdentifier: identifier)]
+        }
+        queue.enqueue([.asset(localIdentifier: "video-1")])
+        await settle(queue) { queue.items.count == 2 && queue.items.allSatisfy { $0.state == .done } }
+        XCTAssertEqual(queue.items.last?.source, .videoOriginal(localIdentifier: "video-1"))
+        XCTAssertEqual(queue.completedSourceCount, 1)
+        XCTAssertTrue(queue.completedSourceKeys.contains(UploadQueue.videoOriginalKeyPrefix + "video-1"))
+    }
+
+    func testAVideoOriginalRowRestoresAsOne() {
+        let row = PersistedUploadItem(id: UUID(), source: .asset("video-1"), name: "IMG_1.MOV", byteCount: 1,
+                                      attempts: 0, failureReason: nil, failureRetryable: false, videoOriginal: true)
+        XCTAssertEqual(row.mediaSource, .videoOriginal(localIdentifier: "video-1"))
+    }
+
     /// An edit-base row restores as one, never as a motion row: committing a
     /// photo as a Live Photo's motion would write a bad item to the account.
     func testAnEditBaseRowRestoresAsAnEditBaseRow() async {
