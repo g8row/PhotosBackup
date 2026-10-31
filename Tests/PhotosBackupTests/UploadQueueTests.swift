@@ -553,6 +553,16 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertTrue(restored.useQuota)
     }
 
+    func testLivePhotoMotionIsOnUnlessTurnedOff() throws {
+        let suite = "live-motion-default-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = BackupPreferences(defaults: defaults)
+        XCTAssertTrue(first.backUpLivePhotoMotion)
+        first.backUpLivePhotoMotion = false
+        XCTAssertFalse(BackupPreferences(defaults: defaults).backUpLivePhotoMotion)
+    }
+
     /// 0.3.4 and earlier persisted `useQuota` and `saver` inside every prepared
     /// checkpoint. Those keys are gone, and upgrading must not fail to decode a
     /// queue that still carries them — a throw here would drop the user's
