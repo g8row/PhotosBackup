@@ -698,56 +698,106 @@ final class UploadQueueTests: XCTestCase {
 
     /// A worker shaped like the real one when the duplicate check finds the
     /// file: it stages a checkpoint, drops it, then settles the row.
-    private func alreadyBackedUpWorker(adjustedAt: Date?) -> UploadWorker {
+    private func alreadyBackedUpWorker(editMark: String?) -> UploadWorker {
         { _, _, _, _, emit in
             await emit(.checkpoint(UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
                                                     modified: Date(timeIntervalSince1970: 100), byteCount: 123,
-                                                    temporary: true, prepared: nil, adjustedAt: adjustedAt)))
+                                                    temporary: true, prepared: nil, editMark: editMark)))
             await emit(.checkpoint(nil))
             return .alreadyBackedUp(mediaKey: "KEY")
         }
+    }
+
+    private func temporaryPersistence() throws -> FileUploadQueuePersistence {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return FileUploadQueuePersistence(url: directory.appendingPathComponent("queue.json"))
+    }
+
+    private func restoredQueue(_ persistence: FileUploadQueuePersistence) -> UploadQueue {
+        let queue = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        queue.activateAccount("person@gmail.com")
+        return queue
     }
 
     /// A background window runs in a fresh process, so the edit a backup
     /// carried has to survive a relaunch for the next scan to tell a real edit
     /// from any other library change.
     func testTheEditAnAssetWasBackedUpWithSurvivesRelaunch() async throws {
-        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        let persistence = FileUploadQueuePersistence(url: directory.appendingPathComponent("queue.json"))
-        let edited = Date(timeIntervalSince1970: 1_790_000_000.25)
-        let first = UploadQueue(worker: alreadyBackedUpWorker(adjustedAt: edited), maxConcurrent: 1,
+        let persistence = try temporaryPersistence()
+        let first = UploadQueue(worker: alreadyBackedUpWorker(editMark: "t1790000000250"), maxConcurrent: 1,
                                 persistence: persistence)
         first.activateAccount("person@gmail.com")
         first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
         await settle(first) { first.items.first?.state == .alreadyBackedUp }
 
-        let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
-        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
-        restored.activateAccount("person@gmail.com")
-        XCTAssertFalse(restored.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited))
-        XCTAssertTrue(restored.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited.addingTimeInterval(60)))
+        let restored = restoredQueue(persistence)
+        XCTAssertFalse(restored.needsRecheck(assetIdentifier: "asset-1", editMark: "t1790000000250"))
+        XCTAssertTrue(restored.needsRecheck(assetIdentifier: "asset-1", editMark: "t1790000060250"))
         XCTAssertEqual(restored.completedSourceCount, 1)
     }
 
-    /// An asset that was never edited uploads its original, which a library
-    /// change cannot alter, so it is never re-checked.
-    func testANeverEditedAssetIsNotRechecked() async {
-        let queue = UploadQueue(worker: alreadyBackedUpWorker(adjustedAt: nil), maxConcurrent: 1)
+    /// Issue #34: an iOS update made PhotoKit report the whole library as
+    /// changed, and every backup was forgotten. A favourite, an album move or
+    /// photo analysis leaves the edit mark alone; an edit or revert moves it.
+    func testOnlyAChangedEditMarkIsRechecked() async {
+        let queue = UploadQueue(worker: alreadyBackedUpWorker(editMark: "n"), maxConcurrent: 1)
+        queue.enqueue([.asset(localIdentifier: "plain")])
+        await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
+        XCTAssertEqual(queue.assetsNeedingRecheck(editMarks: ["plain": "n"]), [])
+        // A first edit of a photo backed up unedited, with or without the
+        // private timestamp, is a real change.
+        XCTAssertEqual(queue.assetsNeedingRecheck(editMarks: ["plain": "fcom.apple.photo"]), ["plain"])
+        XCTAssertEqual(queue.assetsNeedingRecheck(editMarks: ["plain": "t1790000000000"]), ["plain"])
+        XCTAssertEqual(queue.completedSourceCount, 1)
+    }
+
+    /// A photo backed up before edits were recorded has no mark. Its current
+    /// mark becomes the baseline instead of a re-check, and a later edit is
+    /// still caught.
+    func testABackupFromBeforeEditTrackingTakesItsCurrentMarkAsTheBaseline() async throws {
+        let persistence = try temporaryPersistence()
+        let legacy = UploadQueue(worker: alreadyBackedUpWorker(editMark: nil), maxConcurrent: 1,
+                                 persistence: persistence)
+        legacy.activateAccount("person@gmail.com")
+        legacy.enqueue([.asset(localIdentifier: "edited"), .asset(localIdentifier: "plain")], skippingExisting: true)
+        await settle(legacy) { legacy.items.allSatisfy { $0.state == .alreadyBackedUp } }
+        XCTAssertEqual(legacy.completedSourceKeys, ["asset:edited", "asset:plain"])
+
+        XCTAssertEqual(legacy.assetsNeedingRecheck(editMarks: ["edited": "fcom.apple.photo", "plain": "n"]), [])
+
+        let restored = restoredQueue(persistence)
+        XCTAssertEqual(restored.assetsNeedingRecheck(editMarks: ["edited": "fcom.apple.photo", "plain": "n"]), [])
+        XCTAssertEqual(restored.assetsNeedingRecheck(editMarks: ["edited": "n"]), ["edited"])
+        XCTAssertEqual(restored.completedSourceCount, 2)
+    }
+
+    /// An asset never backed up has nothing to keep, so it gets no baseline.
+    func testAnAssetNeverBackedUpGetsNoBaseline() {
+        let queue = UploadQueue(worker: WorkerScript([]).worker())
+        XCTAssertEqual(queue.assetsNeedingRecheck(editMarks: ["new": "n"]), ["new"])
+        XCTAssertTrue(queue.completedSourceKeys.isEmpty)
+    }
+
+    /// Forgetting an asset drops its old mark with it, so the re-check
+    /// records only the edit it finds and the ledger does not keep stale marks.
+    func testForgettingAnAssetDropsItsEditMark() async {
+        let queue = UploadQueue(worker: alreadyBackedUpWorker(editMark: "fcom.apple.photo"), maxConcurrent: 1)
         queue.enqueue([.asset(localIdentifier: "asset-1")])
         await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
-        XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", adjustedAt: nil))
-        XCTAssertEqual(queue.completedSourceKeys, ["asset:asset-1"])
+        XCTAssertEqual(queue.completedSourceKeys, ["asset:asset-1", "edited:asset-1@fcom.apple.photo"])
+        XCTAssertEqual(queue.forgetCompletedSources(for: [.asset(localIdentifier: "asset-1")]), 1)
+        XCTAssertTrue(queue.completedSourceKeys.isEmpty)
     }
 
     /// A row restored mid-preparation keeps the edit its checkpoint recorded,
     /// even though the worker drops the checkpoint before settling the row.
     func testARestoredRowRecordsTheEditItsCheckpointCarried() async {
-        let edited = Date(timeIntervalSince1970: 1_790_000_000)
         let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
                                           modified: Date(timeIntervalSince1970: 100), byteCount: 123,
-                                          temporary: true, prepared: nil, adjustedAt: edited)
+                                          temporary: true, prepared: nil, editMark: "t1790000000000")
         let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
             version: UploadQueueSnapshot.version, accountIdentifier: "person@gmail.com",
             items: [PersistedUploadItem(id: UUID(), source: .asset("asset-1"), name: "IMG.JPG", byteCount: 123,
@@ -762,7 +812,7 @@ final class UploadQueueTests: XCTestCase {
         let queue = UploadQueue(worker: resumingWorker, maxConcurrent: 1, persistence: persistence)
         queue.activateAccount("person@gmail.com")
         await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
-        XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", adjustedAt: edited))
+        XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", editMark: "t1790000000000"))
     }
 
     func testAMotionCheckpointKeepsItsStillHash() throws {

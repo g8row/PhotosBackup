@@ -151,7 +151,7 @@ struct PhotosUploader {
                     prepared: nil,
                     continuesAfterProcessExit: await client.usesBackgroundFileTransfers,
                     pairedStillHash: media.pairedStillHash,
-                    adjustedAt: media.adjustedAt
+                    editMark: media.editMark
                 )
                 let name: String
                 if media.pairedStillHash != nil {

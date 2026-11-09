@@ -49,9 +49,9 @@ struct ExportedMedia: Equatable, Sendable {
     /// For a Live Photo motion: SHA-1 of the still the motion belongs to, the
     /// dedup key of the item it is attached to.
     var pairedStillHash: Data? = nil
-    /// For a library asset on iOS 18 and later: its `adjustmentTimestamp` as
-    /// read before the file was copied. Nil when it was never edited.
-    var adjustedAt: Date? = nil
+    /// For a library asset: `PHAsset.editMark` as read before the file was
+    /// copied. Nil for sources that are not library assets.
+    var editMark: String? = nil
 }
 
 /// Turns a `MediaSource` into a file `GPMCClient.upload` can read, and cleans
@@ -218,11 +218,10 @@ actor MediaExporter {
         let original = resources.first { $0.type == .photo || $0.type == .video }?.originalFilename
         let filename = Self.uploadFilename(original: original, rendition: resource.originalFilename)
         // Read before the copy: an edit landing mid-copy then leaves the older
-        // timestamp on record, so the next scan re-checks the asset.
-        var adjustedAt: Date?
-        if #available(iOS 18, *) { adjustedAt = asset.adjustmentTimestamp }
+        // mark on record, so the next scan re-checks the asset.
+        let editMark = asset.editMark
         var media = try await stage(resource, as: filename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
-        media.adjustedAt = adjustedAt
+        media.editMark = editMark
         return media
     }
 
@@ -475,4 +474,35 @@ private final class DataCollector: @unchecked Sendable {
     private var buffer = Data()
     var data: Data { lock.lock(); defer { lock.unlock() }; return buffer }
     func append(_ chunk: Data) { lock.lock(); buffer.append(chunk); lock.unlock() }
+}
+
+extension PHAsset {
+    /// Identifies the edit this asset carries, so a later scan can tell an edit
+    /// from the many other changes PhotoKit reports (favourites, album moves,
+    /// its own photo analysis), which leave the uploaded file alone.
+    ///
+    /// - `t<ms>`: when it was last edited or reverted. PhotoKit keeps this as
+    ///   `adjustmentTimestamp` but does not publish it, so it is read by key,
+    ///   only when the running iOS has it. Every edit and revert moves it.
+    /// - `f<format>`: the public fallback, the format of the edit applied.
+    ///   Catches a first edit and a revert; a further edit in the same app
+    ///   keeps the same mark, which Re-check Backups covers.
+    /// - `n`: never edited. Recorded too, so a backup with no mark at all is
+    ///   known to predate edit tracking.
+    var editMark: String {
+        if let edited = Self.privateAdjustmentTimestamp(of: self) {
+            return "t" + String(Int64((edited.timeIntervalSince1970 * 1000).rounded()))
+        }
+        guard hasAdjustments else { return "n" }
+        return "f" + (adjustmentFormatIdentifier ?? "")
+    }
+
+    private static let adjustmentTimestampSelector = NSSelectorFromString("adjustmentTimestamp")
+    /// Whether this iOS has the property; checked once, not per asset.
+    static let hasPrivateAdjustmentTimestamp = PHAsset.instancesRespond(to: adjustmentTimestampSelector)
+
+    private static func privateAdjustmentTimestamp(of asset: PHAsset) -> Date? {
+        guard hasPrivateAdjustmentTimestamp else { return nil }
+        return asset.value(forKey: "adjustmentTimestamp") as? Date
+    }
 }

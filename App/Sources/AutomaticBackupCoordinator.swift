@@ -732,21 +732,21 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// may be stale. Forgetting every changed asset wiped the ledger: PhotoKit
     /// reports far more changes than edits, and a window that hit the batch
     /// limit left the change token where it was, so the next window forgot the
-    /// same assets again, including the ones re-checked in between. Before
-    /// iOS 18 there is no edit timestamp to tell them apart.
+    /// same assets again, including the ones re-checked in between. See
+    /// `PHAsset.editMark` for how an edit is told apart.
     private func sourcesWithChangedContent(_ changed: [MediaSource]) -> [MediaSource] {
-        guard #available(iOS 18, *) else { return changed }
         let identifiers = changed.compactMap { source -> String? in
             if case .asset(let identifier) = source { return identifier }
             return nil
         }
-        var adjustedAt: [String: Date] = [:]
+        var marks: [String: String] = [:]
         PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
-            adjustedAt[asset.localIdentifier] = asset.adjustmentTimestamp
+            marks[asset.localIdentifier] = asset.editMark
         }
+        let recheck = queue.assetsNeedingRecheck(editMarks: marks)
         let edited = changed.filter { source in
             guard case .asset(let identifier) = source else { return true }
-            return queue.needsRecheck(assetIdentifier: identifier, adjustedAt: adjustedAt[identifier])
+            return recheck.contains(identifier)
         }
         if edited.count < changed.count {
             DiagnosticEventLog.shared.record(
