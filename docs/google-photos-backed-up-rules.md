@@ -15,6 +15,7 @@ Google Photos app would upload itself for the item on the iPhone.
 | --- | --- | --- |
 | Unedited photo or video | The original (`.photo` / `.video`) | The same |
 | Edited by the camera or in Apple Photos (styles, Portrait, crop, Auto) | The rendered edit (`.fullSizePhoto` / `.fullSizeVideo`) | The same |
+| Edited video, including every Cinematic video | Counted once both the rendered edit and the original (`.video`) are in the account (iOS 27.2, Google Photos 7.98) | The rendered edit, then the original in its own row |
 | Edited in the Google Photos app (`com.google.photos.editing.filtering.nondestructive`) | The version Google's edit was applied on (`.adjustmentBasePhoto`) | The finished edit, then the base in its own row |
 | Saved to the iPhone from Google Photos | Never counted | Nothing helps. An edit in Apple Photos makes a new file that counts |
 
@@ -26,6 +27,10 @@ Google Photos app would upload itself for the item on the iPhone.
 - **Downloads from Google Photos.** A forced re-upload returned the library
   item that already held those bytes, and the app still did not count it.
   After a trivial edit in Apple Photos, the rendered file counted.
+- **Cinematic videos.** On 31 Oct 2026, about 55 of 62 showed "not backed up"
+  with only their rendered edits uploaded, and none did once their originals
+  were added. All 62 originals went up together, so this does not show which
+  videos needed one. The camera saves every Cinematic video as edited.
 - **Archive.** Archiving the matching item un-counts the photo.
 - **Editing again.** A photo edited again is not backed up until its new
   render is uploaded.

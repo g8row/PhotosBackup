@@ -135,6 +135,11 @@ struct PhotosUploader {
                     // since reverted: nothing to add. Settle the row.
                     DiagnosticEventLog.shared.record("upload", "A photo had no Google Photos edit to back up the base of, so its row finished without uploading")
                     return .alreadyBackedUp(mediaKey: "")
+                } catch MediaExporter.Failure.noVideoOriginal {
+                    // The edit was reverted, so the row for the asset already
+                    // covers the original. Settle the row.
+                    DiagnosticEventLog.shared.record("upload", "A video had no separate original to back up, so its row finished without uploading")
+                    return .alreadyBackedUp(mediaKey: "")
                 }
                 if media.byteCount >= largeItemThreshold {
                     DiagnosticEventLog.shared.record(
@@ -158,6 +163,8 @@ struct PhotosUploader {
                     name = "\(media.filename) (Live Photo motion)"
                 } else if case .editBase = source {
                     name = "\(media.filename) (before Google Photos edit)"
+                } else if case .videoOriginal = source {
+                    name = "\(media.filename) (original)"
                 } else {
                     name = media.filename
                 }

@@ -158,6 +158,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         await photos.start()
         await queueEditedVersionsOnce()
         await queueEditBasesOnce()
+        await queueVideoOriginals()
         await queueLivePhotoMotion()
         applyNetworkPolicy()
         updateSchedule()
@@ -191,6 +192,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         Task {
             await queueEditedVersionsOnce()
             await queueEditBasesOnce()
+            await queueVideoOriginals()
             await queueLivePhotoMotion()
         }
     }
@@ -207,7 +209,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// as every row finishes, so a full-library backup pays for it once per
     /// item, and asking for the asset twice doubled that for no gain.
     private func followUps(after source: MediaSource) -> [MediaSource] {
-        // A motion or edit-base row is itself a follow-up and has none of its
+        // A motion, edit-base or video-original row is itself a follow-up and has none of its
         // own. Checked before the fetch, which is the expensive part.
         guard case .asset(let identifier) = source,
               let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject
@@ -220,6 +222,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // for an asset that carries an adjustment.
         if MediaExporter.hasEditBase(asset) {
             followUps.append(.editBase(localIdentifier: identifier))
+        }
+        if MediaExporter.hasVideoOriginal(asset) {
+            followUps.append(.videoOriginal(localIdentifier: identifier))
         }
         return followUps
     }
@@ -249,6 +254,36 @@ final class AutomaticBackupCoordinator: ObservableObject {
         DiagnosticEventLog.shared.record(
             "queue",
             "Queued the pre-edit version of \(queued) photo\(queued == 1 ? "" : "s") edited in the Google Photos app, which that app checks before it counts them as backed up"
+        )
+    }
+
+    /// Queue the original of every edited video remembered as backed up whose
+    /// original is not recorded yet. Runs at each start, like the motion scan:
+    /// the enqueue skips rows already tracked, so this only adds what is missing.
+    private func queueVideoOriginals() async {
+        guard let email = account.status.email, MediaLibrary.isReadable,
+              queue.persistenceWarning == nil else { return }
+        let completed = queue.completedSourceKeys
+        let identifiers = completed.compactMap { key -> String? in
+            guard key.hasPrefix("asset:") else { return nil }
+            let identifier = String(key.dropFirst("asset:".count))
+            return completed.contains(UploadQueue.videoOriginalKeyPrefix + identifier) ? nil : identifier
+        }
+        guard !identifiers.isEmpty else { return }
+        let (read, originals) = await Task.detached(priority: .utility) { () -> (Int, [MediaSource]) in
+            var found: [MediaSource] = []
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            assets.enumerateObjects { asset, _, _ in
+                if MediaExporter.hasVideoOriginal(asset) { found.append(.videoOriginal(localIdentifier: asset.localIdentifier)) }
+            }
+            return (assets.count, found)
+        }.value
+        // The library read runs off the main actor; the account can change meanwhile.
+        guard account.status.email == email, !originals.isEmpty else { return }
+        let queued = queue.enqueue(originals, skippingExisting: true).count
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Queued the original of \(queued) of \(originals.count) edited videos, from \(read) of \(identifiers.count) library items read; the Google Photos app checks it before it counts them as backed up"
         )
     }
 

@@ -58,10 +58,10 @@ final class BackupPreferences: ObservableObject {
             defaults.object(forKey: Key.concurrentUploads) as? Int ?? 2)
         storageSaver = defaults.bool(forKey: Key.storageSaver)
         useQuota = defaults.bool(forKey: Key.useQuota)
-        // Off until asked for: turning it on uploads the motion of every Live
-        // Photo already backed up, a few MB each, which an update should not
-        // start on its own.
-        backUpLivePhotoMotion = defaults.bool(forKey: Key.backUpLivePhotoMotion)
+        // On unless turned off: Free up space only offers a Live Photo with its
+        // motion attached. An update uploads the motion of every Live Photo
+        // already backed up, a few MB each.
+        backUpLivePhotoMotion = defaults.object(forKey: Key.backUpLivePhotoMotion) as? Bool ?? true
     }
 
     func toggle(albumID: String) {

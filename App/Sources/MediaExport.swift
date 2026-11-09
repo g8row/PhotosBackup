@@ -28,6 +28,11 @@ enum MediaSource: Equatable, Sendable {
     /// this version (seen on device on 2026-09-19); the finished edit and the
     /// original do not count.
     case editBase(localIdentifier: String)
+    /// The unedited file of the edited video with this `PHAsset` identifier
+    /// (`.video`), backed up beside its rendered edit. With only the edit in the
+    /// account, the Google Photos app did not count Cinematic videos as backed
+    /// up; it did once the originals were added (seen on device on 2026-10-31).
+    case videoOriginal(localIdentifier: String)
 }
 
 /// A picked item with no resolvable asset id. Wraps the provider so the file
@@ -65,6 +70,7 @@ actor MediaExporter {
         case liveOnly
         case noMotion
         case noEditBase
+        case noVideoOriginal
         case iCloudDownloadRequired
         var errorDescription: String? {
             switch self {
@@ -73,6 +79,7 @@ actor MediaExporter {
             case .liveOnly: return "That item is a Live Photo motion track, which this release does not upload."
             case .noMotion: return "That Live Photo has no motion to back up."
             case .noEditBase: return "That photo has no Google Photos edit to back up the base of."
+            case .noVideoOriginal: return "That video has no separate original to back up."
             case .iCloudDownloadRequired: return "That item is only in iCloud. It will continue when the app is open."
             case .unreadable(let detail): return "Could not read that item: \(detail)"
             }
@@ -154,6 +161,8 @@ actor MediaExporter {
             return try await exportMotion(identifier, allowsNetworkAccess: allowsNetworkAccess)
         case .editBase(let identifier):
             return try await exportEditBase(identifier, allowsNetworkAccess: allowsNetworkAccess)
+        case .videoOriginal(let identifier):
+            return try await exportVideoOriginal(identifier, allowsNetworkAccess: allowsNetworkAccess)
         }
     }
 
@@ -252,6 +261,23 @@ actor MediaExporter {
         let original = resources.first { $0.type == .photo }?.originalFilename
         let filename = Self.uploadFilename(original: original, rendition: base.originalFilename)
         return try await stage(base, as: filename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
+    }
+
+    /// Whether a video keeps an original apart from what `.asset` uploads.
+    static func hasVideoOriginal(_ asset: PHAsset) -> Bool {
+        asset.mediaType == .video && asset.hasAdjustments
+    }
+
+    /// The unedited file of an edited video, under its own name.
+    private func exportVideoOriginal(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+            throw Failure.missingAsset
+        }
+        guard Self.hasVideoOriginal(asset),
+              let original = PHAssetResource.assetResources(for: asset).first(where: { $0.type == .video }) else {
+            throw Failure.noVideoOriginal
+        }
+        return try await stage(original, as: original.originalFilename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
     }
 
     /// `adjustmentFormatIdentifier` from an asset's adjustment plist, or nil.
