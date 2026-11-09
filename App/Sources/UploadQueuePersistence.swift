@@ -8,10 +8,11 @@ enum PersistedMediaSource: Codable, Equatable, Sendable {
 
     init?(_ source: MediaSource) {
         switch source {
-        // Motion and edit-base rows are stored as their asset plus a flag on
+        // Motion, edit-base and video-original rows are stored as their asset plus a flag on
         // `PersistedUploadItem`, so a snapshot stays readable by builds that
         // predate them.
-        case .asset(let identifier), .livePhotoMotion(let identifier), .editBase(let identifier):
+        case .asset(let identifier), .livePhotoMotion(let identifier), .editBase(let identifier),
+             .videoOriginal(let identifier):
             self = .asset(identifier)
         case .file(let url): self = .file(url.standardizedFileURL.path)
         case .picked: return nil
@@ -68,11 +69,14 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
     /// True for a Google Photos edit-base row, stored the same way as a motion
     /// row. Never set together with `motion`.
     let editBase: Bool?
+    /// True for an edited video's original row, stored the same way.
+    let videoOriginal: Bool?
 
     init(id: UUID, source: PersistedMediaSource, name: String, byteCount: Int64,
          attempts: Int, failureReason: String?, failureRetryable: Bool,
          checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil,
-         interruptedPreparations: Int? = nil, motion: Bool? = nil, editBase: Bool? = nil) {
+         interruptedPreparations: Int? = nil, motion: Bool? = nil, editBase: Bool? = nil,
+         videoOriginal: Bool? = nil) {
         self.id = id
         self.source = source
         self.name = name
@@ -85,12 +89,14 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
         self.interruptedPreparations = interruptedPreparations
         self.motion = motion
         self.editBase = editBase
+        self.videoOriginal = videoOriginal
     }
 
     var mediaSource: MediaSource {
         if case .asset(let identifier) = source {
             if motion == true { return .livePhotoMotion(localIdentifier: identifier) }
             if editBase == true { return .editBase(localIdentifier: identifier) }
+            if videoOriginal == true { return .videoOriginal(localIdentifier: identifier) }
         }
         return source.mediaSource
     }
