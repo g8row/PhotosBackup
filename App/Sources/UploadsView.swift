@@ -163,7 +163,7 @@ struct UploadsView: View {
                 }
                 .padding(.vertical, 6)
             }
-            ForEach(queue.items) { item in activityRow(item) }
+            ForEach(listed.items) { item in activityRow(item) }
         } header: {
             HStack {
                 Text("Uploads")
@@ -171,11 +171,18 @@ struct UploadsView: View {
                 if !queue.isIdle { Text("\(queue.activeCount) remaining") }
             }
         } footer: {
-            if queue.deferredForICloudCount > 0 {
-                Text("\(queue.deferredForICloudCount) items need to download from iCloud first. Keep the app open to finish them.")
-            }
+            let notes = [
+                listed.hiddenQueued > 0 ? "\(listed.hiddenQueued.formatted()) more waiting their turn." : nil,
+                listed.hiddenFinished > 0 ? "\(listed.hiddenFinished.formatted()) older finished items not shown." : nil,
+                queue.deferredForICloudCount > 0
+                    ? "\(queue.deferredForICloudCount) items need to download from iCloud first. Keep the app open to finish them."
+                    : nil,
+            ].compactMap { $0 }
+            if !notes.isEmpty { Text(notes.joined(separator: " ")) }
         }
     }
+
+    private var listed: ActivityListing { ActivityListing(queue.items) }
 
     private var stopBackupMessage: String {
         if preferences.automaticBackup {
@@ -284,5 +291,37 @@ struct UploadsView: View {
         case .cancelled, .waitingToRetry, .waitingForICloud: return .orange
         default: return BackupTheme.blue
         }
+    }
+}
+
+/// The rows the Activity list shows. A whole-library backup queues tens of
+/// thousands of rows, and a list that long is drawn and diffed again on every
+/// change anywhere in the queue, which is what made the tab slow (#8). Rows
+/// in progress or needing a decision always show; of the rest, only the next
+/// few waiting and the latest finished, with the footer counting the others.
+struct ActivityListing {
+    static let queuedShown = 20
+    static let finishedShown = 50
+
+    let items: [UploadItem]
+    let hiddenQueued: Int
+    let hiddenFinished: Int
+
+    init(_ all: [UploadItem]) {
+        var queued: [Int] = []
+        var finished: [Int] = []
+        var shown = IndexSet()
+        for (index, item) in all.enumerated() {
+            switch item.state {
+            case .queued: queued.append(index)
+            case .done, .alreadyBackedUp: finished.append(index)
+            default: shown.insert(index)
+            }
+        }
+        queued.prefix(Self.queuedShown).forEach { shown.insert($0) }
+        finished.suffix(Self.finishedShown).forEach { shown.insert($0) }
+        items = shown.map { all[$0] }
+        hiddenQueued = max(0, queued.count - Self.queuedShown)
+        hiddenFinished = max(0, finished.count - Self.finishedShown)
     }
 }

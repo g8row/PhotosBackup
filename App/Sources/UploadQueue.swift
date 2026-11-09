@@ -217,6 +217,7 @@ final class UploadQueue: ObservableObject {
     /// instead of persisted as durable "skip this source" markers.
     private var discardsCancelledRows = false
     private var persistScheduled = false
+    private var lastPersistAt = Date.distantPast
     /// See `PreparationMarkerStoring`. Nil where the guard is not exercised.
     private let preparationMarkers: PreparationMarkerStoring?
     /// Rows between their start and a prepared checkpoint, mirrored to
@@ -1242,11 +1243,25 @@ final class UploadQueue: ObservableObject {
     /// the whole items array. Batching to one write per main-actor turn keeps
     /// the durability guarantee (nothing yields between the mutation and the
     /// flush) while collapsing the five or six writes an item used to cost.
+    /// The shortest gap between two coalesced snapshot writes. One per turn
+    /// still meant several a second on a large re-check, each one walking and
+    /// encoding a queue of tens of thousands of rows: the 17 GB a day of disk
+    /// writes and the CPU kills in #34's report. A completion is safe without
+    /// it, in the ledger written as each row finishes, and a checkpoint goes
+    /// through `persistNow`, so only the queued rows' snapshot lags.
+    static let persistMinInterval: TimeInterval = 1
+
     private func persist() {
         guard persistence != nil, accountIdentifier != nil else { return }
         guard !persistScheduled else { return }
         persistScheduled = true
+        // A store that keeps completions in the snapshot itself needs every
+        // write, or a completion could be lost; only the separate ledger lets
+        // the snapshot lag.
+        let wait = persistence?.storesCompletionLedgerSeparately == true
+            ? max(0, Self.persistMinInterval - Date().timeIntervalSince(lastPersistAt)) : 0
         Task { @MainActor [weak self] in
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
             guard let self, self.persistScheduled else { return }
             self.persistScheduled = false
             self.persistNow()
@@ -1258,6 +1273,7 @@ final class UploadQueue: ObservableObject {
     /// runs as the process is about to be suspended.
     private func persistNow() {
         persistScheduled = false
+        lastPersistAt = Date()
         guard let accountIdentifier, let persistence else { return }
         let storedItems = items.compactMap { item -> PersistedUploadItem? in
             guard let source = PersistedMediaSource(item.source)

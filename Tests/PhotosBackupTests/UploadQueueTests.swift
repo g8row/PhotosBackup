@@ -1350,3 +1350,33 @@ final class UploadQueueTests: XCTestCase {
         assertAggregatesMatchRows(queue)
     }
 }
+
+final class ActivityListingTests: XCTestCase {
+    private func item(_ state: UploadItem.State) -> UploadItem {
+        var item = UploadItem(source: .asset(localIdentifier: UUID().uuidString))
+        item.state = state
+        return item
+    }
+
+    /// #8: a whole-library queue must not put every row in the list.
+    func testALargeQueueListsWhatMattersAndCountsTheRest() {
+        let all = (0..<100).map { _ in item(.done) }
+            + [item(.uploading(fraction: 0.5)), item(.failed(reason: "x", retryable: true)), item(.cancelled)]
+            + (0..<1000).map { _ in item(.queued) }
+        let listing = ActivityListing(all)
+        XCTAssertEqual(listing.items.count, 3 + ActivityListing.queuedShown + ActivityListing.finishedShown)
+        XCTAssertEqual(listing.hiddenQueued, 1000 - ActivityListing.queuedShown)
+        XCTAssertEqual(listing.hiddenFinished, 100 - ActivityListing.finishedShown)
+        // In queue order, keeping the latest finished.
+        XCTAssertEqual(listing.items.first?.id, all[50].id)
+        XCTAssertEqual(listing.items[ActivityListing.finishedShown].id, all[100].id)
+    }
+
+    func testASmallQueueListsEverything() {
+        let all = [item(.done), item(.queued), item(.hashing(fraction: 0.1))]
+        let listing = ActivityListing(all)
+        XCTAssertEqual(listing.items.map(\.id), all.map(\.id))
+        XCTAssertEqual(listing.hiddenQueued, 0)
+        XCTAssertEqual(listing.hiddenFinished, 0)
+    }
+}
