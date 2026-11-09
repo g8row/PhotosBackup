@@ -99,6 +99,14 @@ struct PhotosBackupApp: App {
                     DiagnosticEventLog.shared.record("settings", "Back Up Live Photo Motion turned \(value ? "on" : "off")")
                     automaticBackup.livePhotoMotionPreferenceDidChange()
                 }
+                .onChange(of: preferences.keepAliveEnabled) { value in
+                    DiagnosticEventLog.shared.record("settings", "Keep Running in Background turned \(value ? "on" : "off")")
+                    automaticBackup.keepAlivePreferenceDidChange()
+                }
+                .onChange(of: preferences.keepAliveMode) { value in
+                    DiagnosticEventLog.shared.record("settings", "Keep-alive mode set to \(value.title)")
+                    automaticBackup.keepAlivePreferenceDidChange()
+                }
                 .onChange(of: preferences.concurrentUploads) { value in
                     DiagnosticEventLog.shared.record("settings", "Simultaneous uploads set to \(value)")
                     queue.setMaxConcurrent(value)

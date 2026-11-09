@@ -33,6 +33,8 @@ final class BackupPreferences: ObservableObject {
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
         static let backUpLivePhotoMotion = "backup.livePhotoMotion"
+        static let keepAliveEnabled = "backup.keepAlive.enabled"
+        static let keepAliveMode = "backup.keepAlive.mode"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -43,6 +45,10 @@ final class BackupPreferences: ObservableObject {
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
     @Published var backUpLivePhotoMotion: Bool { didSet { defaults.set(backUpLivePhotoMotion, forKey: Key.backUpLivePhotoMotion) } }
+    /// Keep the app running in the background while work is queued. See
+    /// `BackgroundKeepAlive`.
+    @Published var keepAliveEnabled: Bool { didSet { defaults.set(keepAliveEnabled, forKey: Key.keepAliveEnabled) } }
+    @Published var keepAliveMode: KeepAliveMode { didSet { defaults.set(keepAliveMode.rawValue, forKey: Key.keepAliveMode) } }
 
     private let defaults: UserDefaults
 
@@ -62,6 +68,11 @@ final class BackupPreferences: ObservableObject {
         // Photo already backed up, a few MB each, which an update should not
         // start on its own.
         backUpLivePhotoMotion = defaults.bool(forKey: Key.backUpLivePhotoMotion)
+        // On unless turned off: without it iOS suspends the app seconds after
+        // it leaves the foreground, which is the most reported problem. Silent
+        // audio needs no permission, and it stops once the queue cannot move.
+        keepAliveEnabled = defaults.object(forKey: Key.keepAliveEnabled) as? Bool ?? true
+        keepAliveMode = KeepAliveMode(rawValue: defaults.string(forKey: Key.keepAliveMode) ?? "") ?? .audio
     }
 
     func toggle(albumID: String) {

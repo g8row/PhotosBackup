@@ -27,6 +27,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Only used if you choose Location for Keep Running in Background. The location itself is ignored; receiving it is what lets iOS keep the backup running while the app is closed.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Photos Backup needs access to the albums and photos you choose so it can safely back them up to Google Photos.</string>
 	<key>UIApplicationSceneManifest</key>
@@ -36,6 +38,8 @@
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>audio</string>
+		<string>location</string>
 		<string>processing</string>
 	</array>
 	<key>UILaunchScreen</key>
