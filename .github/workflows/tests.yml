@@ -30,7 +30,7 @@ jobs:
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
           DEVELOPER_DIR="$XCODE_APP/Contents/Developer" xcodebuild -version
         env:
-          XCODE_APP: /Applications/Xcode_16.4.app
+          XCODE_APP: /Applications/Xcode_26.3.app
 
       - name: Install xcodegen
         run: brew install xcodegen
