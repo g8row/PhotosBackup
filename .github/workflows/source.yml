@@ -1,8 +1,14 @@
 name: update-source
 
 on:
+  # Publishing a release starts release-ipa, which builds the IPA and attaches
+  # it minutes later. Running on `published` raced that build and always found
+  # no IPA, so a new release updates the feed once release-ipa has finished.
+  workflow_run:
+    workflows: [release-ipa]
+    types: [completed]
   release:
-    types: [published, edited]
+    types: [edited]
   workflow_dispatch:
 
 permissions:
@@ -18,6 +24,8 @@ env:
 
 jobs:
   build:
+    # A failed IPA build has nothing new to publish.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       # The feed is rebuilt from the GitHub API, not from the tree, and the
@@ -30,10 +38,11 @@ jobs:
       - name: Resolve source repository
         id: src
         run: |
-          # A release event only ever fires on the repository that owns the
-          # release, so that repository is authoritative. On a manual run from
-          # a fork there are no local releases, so fall back to upstream.
-          if [ "${{ github.event_name }}" = "release" ]; then
+          # A release event, and the release-ipa run that follows one, only
+          # fire on the repository that owns the release, so that repository
+          # is authoritative. On a manual run from a fork there are no local
+          # releases, so fall back to upstream.
+          if [ "${{ github.event_name }}" = "release" ] || [ "${{ github.event_name }}" = "workflow_run" ]; then
             repo="${{ github.repository }}"
           else
             repo="${UPSTREAM_REPO}"
