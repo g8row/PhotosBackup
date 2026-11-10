@@ -81,6 +81,10 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     /// How many times the process died while this row was being prepared.
     /// See `UploadQueue.noteInterruptedPreparations`.
     var interruptedPreparations = 0
+    /// The exported asset's `PHAsset.editMark`. Kept here as well as on the
+    /// checkpoint because a row the duplicate check settles drops its
+    /// checkpoint before it finishes.
+    var editMark: String?
 
     init(id: UUID = UUID(), source: MediaSource, name: String = "Preparing…") {
         self.id = id; self.source = source; self.name = name
@@ -627,8 +631,83 @@ final class UploadQueue: ObservableObject {
     var completedSourceCount: Int {
         completedSourceKeys.count - completedSourceKeys.lazy.filter {
             $0.hasPrefix(Self.motionKeyPrefix) || $0.hasPrefix(Self.editBaseKeyPrefix)
+                || $0.hasPrefix(Self.editStateKeyPrefix)
                 || $0.hasPrefix(Self.videoOriginalKeyPrefix)
         }.count
+    }
+
+    /// Ledger prefix of the edit an asset carried when it was backed up: its
+    /// identifier and `PHAsset.editMark`. See `assetsNeedingRecheck`.
+    nonisolated static let editStateKeyPrefix = "edited:"
+
+    nonisolated static func editStateKey(assetIdentifier: String, editMark: String) -> String {
+        editStateKeyPrefix + assetIdentifier + "@" + editMark
+    }
+
+    /// Whether an asset PhotoKit reports as changed may no longer match its
+    /// backup: its edit mark is not the one recorded when it was backed up.
+    func needsRecheck(assetIdentifier: String, editMark: String) -> Bool {
+        !completedSourceKeys.contains(Self.editStateKey(assetIdentifier: assetIdentifier, editMark: editMark))
+    }
+
+    /// The assets with an edit mark on record. Asset identifiers hold no "@".
+    private func assetsWithRecordedEdit() -> Set<String> {
+        var recorded = Set<String>()
+        for key in completedSourceKeys where key.hasPrefix(Self.editStateKeyPrefix) {
+            let rest = key.dropFirst(Self.editStateKeyPrefix.count)
+            if let at = rest.firstIndex(of: "@") { recorded.insert(String(rest[..<at])) }
+        }
+        return recorded
+    }
+
+    /// Of the assets PhotoKit reports as changed, the ones to re-check, given
+    /// each one's current `PHAsset.editMark`.
+    ///
+    /// A backup made before edits were recorded has no mark on file. Treating
+    /// that as "edited since" would re-check every edited photo the first time
+    /// PhotoKit touches the whole library, as it does after an iOS update. Its
+    /// current mark is recorded as the baseline instead: the old build forgot
+    /// every changed asset, so any edit it saw was already backed up again.
+    func assetsNeedingRecheck(editMarks: [String: String]) -> Set<String> {
+        let recorded = assetsWithRecordedEdit()
+        var recheck = Set<String>()
+        var baselines: [String] = []
+        for (identifier, mark) in editMarks {
+            let key = Self.editStateKey(assetIdentifier: identifier, editMark: mark)
+            if completedSourceKeys.contains(key) { continue }
+            if !recorded.contains(identifier), completedSourceKeys.contains("asset:\(identifier)") {
+                baselines.append(key)
+            } else {
+                recheck.insert(identifier)
+            }
+        }
+        if !baselines.isEmpty {
+            completedSourceKeys.formUnion(baselines)
+            if let accountIdentifier, let persistence, persistence.storesCompletionLedgerSeparately {
+                do {
+                    try persistence.recordCompletedSourceKeys(baselines, for: accountIdentifier)
+                } catch {
+                    completionLedgerHealthy = false
+                    persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
+                }
+            }
+            persistNow()
+            DiagnosticEventLog.shared.record(
+                "queue",
+                "Recorded the current edit of \(baselines.count) item\(baselines.count == 1 ? "" : "s") backed up before edits were tracked, so they stay backed up"
+            )
+        }
+        return recheck
+    }
+
+    /// The ledger keys a finished row records: its source, plus the edit it
+    /// carried when it is a library asset that has one.
+    private func completionKeys(for item: UploadItem) -> [String] {
+        var keys = item.source.queueDeduplicationKey.map { [$0] } ?? []
+        if case .asset(let identifier) = item.source, let editMark = item.editMark {
+            keys.append(Self.editStateKey(assetIdentifier: identifier, editMark: editMark))
+        }
+        return keys
     }
 
     /// Ledger prefix of a Google Photos edit's base version, keyed by asset.
@@ -665,6 +744,20 @@ final class UploadQueue: ObservableObject {
         let keys = Set(sources.compactMap(\.queueDeduplicationKey)).intersection(completedSourceKeys)
         guard !keys.isEmpty else { return 0 }
         completedSourceKeys.subtract(keys)
+        // The edit marks of forgotten assets go too, so the re-check records
+        // only the edit it finds; the count below stays one per item.
+        let forgottenAssets = Set(sources.compactMap { source -> String? in
+            if case .asset(let identifier) = source { return identifier }
+            return nil
+        })
+        let staleMarks = Set(completedSourceKeys.lazy.filter { key in
+            guard key.hasPrefix(Self.editStateKeyPrefix) else { return false }
+            let rest = key.dropFirst(Self.editStateKeyPrefix.count)
+            guard let at = rest.firstIndex(of: "@") else { return false }
+            return forgottenAssets.contains(String(rest[..<at]))
+        })
+        completedSourceKeys.subtract(staleMarks)
+        let removedKeys = keys.union(staleMarks)
         items.removeAll { item in
             guard item.state.isFinished,
                   let key = item.source.queueDeduplicationKey else { return false }
@@ -673,7 +766,7 @@ final class UploadQueue: ObservableObject {
         rebuildDerivedState()
         if let accountIdentifier, let persistence {
             do {
-                try persistence.removeCompletedSourceKeys(keys, for: accountIdentifier)
+                try persistence.removeCompletedSourceKeys(removedKeys, for: accountIdentifier)
                 if completionLedgerHealthy { persistenceWarning = nil }
             } catch {
                 completionLedgerHealthy = false
@@ -753,6 +846,7 @@ final class UploadQueue: ObservableObject {
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
                 item.checkpoint = stored.checkpoint
+                item.editMark = stored.checkpoint?.editMark
                 item.interruptedPreparations = stored.interruptedPreparations ?? 0
                 if stored.cancelled == true {
                     item.state = .cancelled
@@ -1002,6 +1096,7 @@ final class UploadQueue: ObservableObject {
             setState(state, at: index)
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
+            if let checkpoint { items[index].editMark = checkpoint.editMark }
             if checkpoint?.prepared != nil { clearPreparationMarker(id) }
             // The durable hand-off to the background transfer: this must be on
             // disk before the worker proceeds, not on the next turn.
@@ -1019,7 +1114,7 @@ final class UploadQueue: ObservableObject {
             let settled: UploadItem.State = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
             items[index].mediaKey = result.mediaKey
             setState(settled, at: index)
-            if let key = items[index].source.queueDeduplicationKey { completedSourceKeys.insert(key) }
+            completedSourceKeys.formUnion(completionKeys(for: items[index]))
             rateLimitDelay = Self.rateLimitBaseDelay
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
@@ -1326,11 +1421,11 @@ final class UploadQueue: ObservableObject {
     }
 
     private func recordCompletion(for item: UploadItem) {
-        guard let accountIdentifier, let persistence,
-              let key = item.source.queueDeduplicationKey,
+        let keys = completionKeys(for: item)
+        guard let accountIdentifier, let persistence, !keys.isEmpty,
               persistence.storesCompletionLedgerSeparately else { return }
         do {
-            try persistence.recordCompletedSourceKey(key, for: accountIdentifier)
+            try persistence.recordCompletedSourceKeys(keys, for: accountIdentifier)
         } catch {
             completionLedgerHealthy = false
             persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
