@@ -9,7 +9,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-: "${DEVELOPER_DIR:=/Applications/Xcode-16.4.0.app/Contents/Developer}"
+: "${DEVELOPER_DIR:=/Applications/Xcode-26.6.0.app/Contents/Developer}"
 export DEVELOPER_DIR
 
 CONFIG="${1:-Release}"
