@@ -50,6 +50,12 @@ without a desktop companion or hosted service.
   is open with work queued, it asks iOS to continue that work in the
   background; iOS shows the progress in a Live Activity, where it can be
   cancelled. In the background at most 2 uploads run at once.
+- Keep Running in Background, on by default: while a backup has work iOS will
+  not move on its own, the app keeps itself awake the way SideStore does, by
+  playing silence mixed with other audio (or, if you choose, with coarse
+  location updates), so the backup carries on with the app closed or the phone
+  locked. It stops when the queue is done, after 12 hours, or when iOS
+  interrupts it, and the app is suspended again.
 - Request recurring iOS background-processing windows for selected-album backup.
 - Expose a **Back Up Photos** Shortcuts action on iOS 16+ for charger,
   time-of-day, Wi-Fi, and other personal automations. It runs even with
@@ -75,9 +81,9 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.3.7** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-Every push and pull request runs the suite on an iPhone simulator: 191 tests,
-189 pass, 0 fail. The 2 opt-in live tests are skipped.
+Latest release: **0.3.8** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+Every push and pull request runs the suite on an iPhone simulator: 208 tests,
+206 pass, 0 fail. The 2 opt-in live tests are skipped.
 
 Each release's `.ipa` is built by GitHub Actions from the tagged commit and
 attached with its SHA-256, so the binary can be checked against the source it
@@ -113,7 +119,8 @@ or so after the crash.
 
 ## Requirements
 
-- macOS with Xcode 16.4 and an installed iOS Simulator runtime
+- macOS with Xcode 26 and an installed iOS Simulator runtime. Xcode 16.4 still
+  builds the app, but leaves out the iOS 26 continued backup.
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.40 or newer
 - iOS 15.0 or newer
 - A Google account for the live connection flow
@@ -175,7 +182,7 @@ sideloading:
 ./Scripts/make-ipa.sh
 ```
 
-The script defaults to `DEVELOPER_DIR=/Applications/Xcode-16.4.0.app/Contents/Developer`.
+The script defaults to `DEVELOPER_DIR=/Applications/Xcode-26.6.0.app/Contents/Developer`.
 Override it only if Xcode lives elsewhere:
 
 ```sh
@@ -271,6 +278,10 @@ Android master token → Photos access token → private Photos API
   only while the app is open. iOS can still end it early to reclaim resources,
   and ends it when the app is swiped away in the app switcher; unfinished work
   waits for the next time the app runs.
+- Keep Running in Background can only start while the app is open, uses more
+  battery, and ends when the app is swiped away in the app switcher. A call or
+  another app taking over audio can stop the audio method; the location method
+  needs location permission.
 - Shortcuts can create extra backup opportunities on iOS 16+, but iOS gives
   each run about 30 seconds. The action queues durable work and gives prepared
   file transfers to the background URL session; it is not a periodic guarantee.

@@ -938,7 +938,13 @@ final class UploadQueueTests: XCTestCase {
         let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
         first.activateAccount("person@gmail.com")
         first.enqueue([.asset(localIdentifier: "old")], skippingExisting: true)
-        await settle(first) { first.items.first?.state == .done }
+        // The memory store keeps completions in the snapshot, which the queue
+        // writes on a later main-actor turn, so wait for the write as well as
+        // the row: a slow runner can see .done before the snapshot has it.
+        await settle(first) {
+            first.items.first?.state == .done
+                && persistence.snapshot?.completedSourceKeys.isEmpty == false
+        }
 
         let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
         restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
