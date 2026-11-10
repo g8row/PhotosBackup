@@ -20,6 +20,7 @@ struct SettingsView: View {
             Form {
                 accountSection
                 backupSection
+                keepAliveSection
                 automationSection
                 verifySection
                 supportSection
@@ -162,6 +163,25 @@ struct SettingsView: View {
             Text("Re-check")
         } footer: {
             Text("Compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
+        }
+    }
+
+    private var keepAliveSection: some View {
+        Section {
+            Toggle("Keep Running in Background", isOn: $preferences.keepAliveEnabled)
+            if preferences.keepAliveEnabled {
+                Picker("Method", selection: $preferences.keepAliveMode) {
+                    ForEach(KeepAliveMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }
+                Text(preferences.keepAliveMode.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } header: {
+            Text("Background")
+        } footer: {
+            Text("iOS normally pauses the app seconds after you leave it, and backs up only when it grants a background window. With this on, the backup keeps going after you switch apps or lock the phone, two uploads at a time, until everything is backed up — then the app sleeps again. It uses more battery; leaving the phone charging works best. Start a backup with the app open; swiping the app away from the app switcher stops it. Each run stops itself after 12 hours.\n\nWith it off, the screen stays on while a backup runs with the app open, since locking the phone would pause it.")
         }
     }
 

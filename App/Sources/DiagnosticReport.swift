@@ -27,6 +27,8 @@ struct AutomaticBackupDiagnosticSnapshot: Sendable {
     let handlerRegistered: Bool
     let appConsideredForeground: Bool
     let foregroundOperationActive: Bool
+    /// "off", or the mode and whether it is holding the app right now.
+    var keepAlive: String = "off"
     let backgroundOperationActive: Bool
     let scheduleBlocker: String?
     let networkStatus: String
@@ -131,6 +133,7 @@ enum DiagnosticReportBuilder {
         field("Coordinator foreground", scheduler.appConsideredForeground)
         field("Foreground operation active", scheduler.foregroundOperationActive)
         field("Background operation active", scheduler.backgroundOperationActive)
+        field("Keep-alive", scheduler.keepAlive)
         field("Schedule blocker", redacted(scheduler.scheduleBlocker))
         field("Last request submitted", scheduler.lastRequestSubmittedAt.map { "\(formatter.string(from: $0)) (\(ago($0)))" })
         field("Pending request count", scheduler.pendingRequests.count)
