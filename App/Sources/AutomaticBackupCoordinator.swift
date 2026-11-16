@@ -230,7 +230,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // A motion, edit-base or video-original row is itself a follow-up and has none of its
         // own. Checked before the fetch, which is the expensive part.
         guard case .asset(let identifier) = source,
-              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject
         else { return [] }
         var followUps: [MediaSource] = []
         if preferences.backUpLivePhotoMotion, asset.mediaSubtypes.contains(.photoLive) {
@@ -260,7 +260,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         let bases = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if MediaExporter.hasEditBase(asset) { found.append(.editBase(localIdentifier: asset.localIdentifier)) }
             }
             return found
@@ -290,7 +290,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !identifiers.isEmpty else { return }
         let (read, originals) = await Task.detached(priority: .utility) { () -> (Int, [MediaSource]) in
             var found: [MediaSource] = []
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames)
             assets.enumerateObjects { asset, _, _ in
                 if MediaExporter.hasVideoOriginal(asset) { found.append(.videoOriginal(localIdentifier: asset.localIdentifier)) }
             }
@@ -321,7 +321,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !identifiers.isEmpty else { return }
         let motions = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if asset.mediaSubtypes.contains(.photoLive) {
                     found.append(.livePhotoMotion(localIdentifier: asset.localIdentifier))
                 }
@@ -357,7 +357,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         let edited = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if asset.hasAdjustments { found.append(.asset(localIdentifier: asset.localIdentifier)) }
             }
             return found
@@ -796,7 +796,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
             return nil
         }
         var marks: [String: String] = [:]
-        PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+        PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
             marks[asset.localIdentifier] = asset.editMark
         }
         let recheck = queue.assetsNeedingRecheck(editMarks: marks)
