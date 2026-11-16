@@ -17,6 +17,18 @@ final class ContinuedBackupTests: XCTestCase {
         XCTAssertFalse(decide(system: true))
     }
 
+    /// A processing window ends once: either the run finishes or the expiry
+    /// fallback hands it back, never both.
+    func testOnlyOneEndingCompletesABackgroundWindow() async {
+        let completion = BackgroundTaskCompletion()
+        let claims = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<20 { group.addTask { completion.claim() } }
+            return await group.reduce(into: 0) { total, claimed in if claimed { total += 1 } }
+        }
+        XCTAssertEqual(claims, 1)
+        XCTAssertFalse(completion.claim())
+    }
+
     func testARenamedBundleLeadsWithItsOwnIDWhenABroadWildcardPermitsIt() {
         // SideStore signs com.g8row.photosbackup as com.g8row.photosbackup.TEAM
         // and leaves the plist as built.
