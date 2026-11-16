@@ -35,6 +35,17 @@ enum MediaSource: Equatable, Sendable {
     case videoOriginal(localIdentifier: String)
 }
 
+extension PHFetchOptions {
+    /// Every frame of a burst, not only the one Photos shows. PhotoKit leaves
+    /// the other frames out by default, and the Google Photos app counts a
+    /// burst as not backed up until they are in the account too.
+    static var includingBurstFrames: PHFetchOptions {
+        let options = PHFetchOptions()
+        options.includeAllBurstAssets = true
+        return options
+    }
+}
+
 /// A picked item with no resolvable asset id. Wraps the provider so the file
 /// can be copied lazily at export time. Reference identity is enough for the
 /// queue's dedup, and picked items are never persisted.
@@ -216,7 +227,7 @@ actor MediaExporter {
     }
 
     private func exportAsset(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
-        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject else {
             throw Failure.missingAsset
         }
         let resources = PHAssetResource.assetResources(for: asset)
@@ -249,7 +260,7 @@ actor MediaExporter {
     /// original's name. Any other stacked edit settles without an upload: the
     /// Google Photos app is only known to check this version for its own.
     private func exportEditBase(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
-        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject else {
             throw Failure.missingAsset
         }
         let resources = PHAssetResource.assetResources(for: asset)
@@ -270,7 +281,7 @@ actor MediaExporter {
 
     /// The unedited file of an edited video, under its own name.
     private func exportVideoOriginal(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
-        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject else {
             throw Failure.missingAsset
         }
         guard Self.hasVideoOriginal(asset),
@@ -300,7 +311,7 @@ actor MediaExporter {
     /// The still is hashed as it streams in rather than staged: only its hash
     /// is needed, to name the item the motion is attached to.
     private func exportMotion(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
-        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject else {
             throw Failure.missingAsset
         }
         let resources = PHAssetResource.assetResources(for: asset)

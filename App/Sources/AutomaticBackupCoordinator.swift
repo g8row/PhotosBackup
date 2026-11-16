@@ -230,7 +230,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // A motion, edit-base or video-original row is itself a follow-up and has none of its
         // own. Checked before the fetch, which is the expensive part.
         guard case .asset(let identifier) = source,
-              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject
         else { return [] }
         var followUps: [MediaSource] = []
         if preferences.backUpLivePhotoMotion, asset.mediaSubtypes.contains(.photoLive) {
@@ -260,7 +260,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         let bases = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if MediaExporter.hasEditBase(asset) { found.append(.editBase(localIdentifier: asset.localIdentifier)) }
             }
             return found
@@ -290,7 +290,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !identifiers.isEmpty else { return }
         let (read, originals) = await Task.detached(priority: .utility) { () -> (Int, [MediaSource]) in
             var found: [MediaSource] = []
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames)
             assets.enumerateObjects { asset, _, _ in
                 if MediaExporter.hasVideoOriginal(asset) { found.append(.videoOriginal(localIdentifier: asset.localIdentifier)) }
             }
@@ -321,7 +321,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !identifiers.isEmpty else { return }
         let motions = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if asset.mediaSubtypes.contains(.photoLive) {
                     found.append(.livePhotoMotion(localIdentifier: asset.localIdentifier))
                 }
@@ -357,7 +357,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         let edited = await Task.detached(priority: .utility) { () -> [MediaSource] in
             var found: [MediaSource] = []
-            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
                 if asset.hasAdjustments { found.append(.asset(localIdentifier: asset.localIdentifier)) }
             }
             return found
@@ -719,6 +719,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let run = AutomaticBackupRunHistory.started(.backgroundProcessing, context: executionContext())
         let startedAt = Date()
         isForeground = false
+        if !continuesInBackground { capBackgroundConcurrency() }
         // Log the resubmission below even though its state has not changed:
         // it is what shows the chain of windows continues.
         loggedScheduleState = nil
@@ -727,6 +728,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         if !continuesInBackground { queue.setICloudDownloadsAllowed(false) }
         queue.resumeSystemWork()
         backgroundOperation?.cancel()
+        let completion = BackgroundTaskCompletion()
 
         let operation = Task { @MainActor [weak self, weak task] in
             guard let self else {
@@ -741,13 +743,15 @@ final class AutomaticBackupCoordinator: ObservableObject {
             if !keepsRunning { AppSessionTracker.note(.background) }
             // iOS may suspend the process as soon as the task completes.
             DiagnosticEventLog.shared.flush()
+            self.backgroundOperation = nil
+            // After an expiry the fallback below may already have told iOS.
+            guard completion.claim() else { return }
             task?.expirationHandler = nil
             task?.setTaskCompleted(success: report.success)
             Self.logger.info("Background-processing window finished; success=\(report.success)")
-            self.backgroundOperation = nil
         }
         backgroundOperation = operation
-        let expire: @Sendable () -> Void = { [weak self] in
+        let expire: @Sendable () -> Void = { [weak self, weak task] in
             let elapsed = Int(Date().timeIntervalSince(startedAt).rounded())
             Self.logger.notice("iOS expired the background-processing window; requeuing unfinished uploads")
             DiagnosticEventLog.shared.record(
@@ -755,16 +759,41 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 "iOS ended the background processing window after \(elapsed) s; unfinished work stays queued",
                 level: .warning
             )
+            DiagnosticEventLog.shared.flush()
             operation.cancel()
-            Task { @MainActor [weak self] in
+            Task { @MainActor [weak self, weak task] in
                 // The queue keeps going when a continued backup holds the app.
                 guard let self, !self.continuesInBackground else { return }
+                // Hand the window back before the cancelled run unwinds: ten
+                // exports in flight can outlast the time iOS allows, and iOS
+                // then suspends the app with this window still open.
                 self.queue.suspendForBackgroundExpiration()
+                AppSessionTracker.note(.background)
+                DiagnosticEventLog.shared.flush()
+                try? await Task.sleep(nanoseconds: Self.expirationGrace)
+                guard completion.claim() else { return }
+                DiagnosticEventLog.shared.record(
+                    "scheduler",
+                    "The cancelled background run had not finished \(Self.expirationGrace / 1_000_000_000) s after iOS ended the window, so the window was handed back without it",
+                    level: .warning
+                )
+                DiagnosticEventLog.shared.flush()
+                task?.setTaskCompleted(success: false)
             }
         }
         task.expirationHandler = expire
         // iOS may already have expired the window while this hop was queued.
         window.adopt(expire)
+    }
+
+    /// How long a cancelled run gets to finish after iOS ends its window,
+    /// before the window is handed back without it.
+    static let expirationGrace: UInt64 = 3_000_000_000
+
+    /// A background process keeps the load it can hold, as a continued backup
+    /// does. Returning to the app restores the chosen number.
+    private func capBackgroundConcurrency() {
+        queue.setMaxConcurrent(min(preferences.concurrentUploads, ContinuedBackupPolicy.backgroundConcurrencyLimit))
     }
 
     static func describeInterval(_ seconds: TimeInterval) -> String {
@@ -796,7 +825,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
             return nil
         }
         var marks: [String: String] = [:]
-        PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil).enumerateObjects { asset, _, _ in
+        PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
             marks[asset.localIdentifier] = asset.editMark
         }
         let recheck = queue.assetsNeedingRecheck(editMarks: marks)
@@ -942,6 +971,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let run = AutomaticBackupRunHistory.started(.shortcut, context: executionContext())
         if !appActive {
             isForeground = false
+            if !continuesInBackground { capBackgroundConcurrency() }
             AppSessionTracker.note(.backgroundWork)
             queue.setPreparationGuardArmed(true)
             if !continuesInBackground { queue.setICloudDownloadsAllowed(false) }
@@ -1014,6 +1044,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // wake like the open app and leave the queue as it is.
         if !isForeground, !continuesInBackground {
             AppSessionTracker.note(.backgroundWork)
+            capBackgroundConcurrency()
             // Filter before restoration so `activateAccount`'s internal pump
             // cannot start fresh exports, and pause network so nothing pumps
             // before the real policy is applied below.
@@ -1381,6 +1412,22 @@ extension AutomaticBackupCoordinator {
 /// Bridges the gap between a `BGProcessingTask` arriving on a system queue and
 /// the coordinator taking it over on the main actor. An expiration that lands
 /// inside that gap is remembered and replayed to the real handler.
+/// Lets exactly one of a window's two endings, the run finishing or the expiry
+/// fallback, tell iOS the task is complete.
+final class BackgroundTaskCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// True for the first caller only.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 final class BackgroundWindow: @unchecked Sendable {
     private let lock = NSLock()
     private var expired = false

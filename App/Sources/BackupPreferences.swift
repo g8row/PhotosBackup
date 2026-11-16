@@ -167,7 +167,7 @@ final class PhotoAlbumStore: ObservableObject {
         var seen = Set<String>()
         func append(_ collection: PHAssetCollection) {
             guard seen.insert(collection.localIdentifier).inserted else { return }
-            let fetch = PHAsset.fetchAssets(in: collection, options: nil)
+            let fetch = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
             guard fetch.count > 0 else { return }
             result.append(PhotoAlbum(
                 id: collection.localIdentifier,
@@ -211,7 +211,7 @@ final class PhotoAlbumStore: ObservableObject {
         return await Task.detached(priority: .userInitiated) {
             var result: [String: [String]] = [:]
             for (id, collection) in targets {
-                let assets = collection.map { PHAsset.fetchAssets(in: $0, options: nil) }
+                let assets = collection.map { PHAsset.fetchAssets(in: $0, options: .includingBurstFrames) }
                     ?? PHAsset.fetchAssets(with: Self.allPhotosOptions())
                 var identifiers: [String] = []
                 identifiers.reserveCapacity(assets.count)
@@ -244,7 +244,7 @@ final class PhotoAlbumStore: ObservableObject {
         for album in albums where albumIDs.contains(album.id) {
             let assets: PHFetchResult<PHAsset>
             if let collection = album.collection {
-                assets = PHAsset.fetchAssets(in: collection, options: nil)
+                assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
             } else {
                 assets = PHAsset.fetchAssets(with: Self.allPhotosOptions())
             }
@@ -293,7 +293,7 @@ final class PhotoAlbumStore: ObservableObject {
     func sources(for albumIDs: Set<String>, matching identifiers: Set<String>) -> [MediaSource] {
         guard !identifiers.isEmpty else { return [] }
         if albumIDs.contains(PhotoAlbum.allPhotosID) {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: nil)
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: .includingBurstFrames)
             var result: [MediaSource] = []
             assets.enumerateObjects { asset, _, _ in
                 guard asset.mediaType == .image || asset.mediaType == .video else { return }
@@ -305,7 +305,7 @@ final class PhotoAlbumStore: ObservableObject {
         var matched = Set<String>()
         for album in albums where albumIDs.contains(album.id) {
             guard let collection = album.collection else { continue }
-            let assets = PHAsset.fetchAssets(in: collection, options: nil)
+            let assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
             assets.enumerateObjects { asset, _, stop in
                 if identifiers.contains(asset.localIdentifier) { matched.insert(asset.localIdentifier) }
                 if matched.count == identifiers.count { stop.pointee = true }
@@ -323,6 +323,7 @@ final class PhotoAlbumStore: ObservableObject {
             PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
         )
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.includeAllBurstAssets = true
         return options
     }
 
