@@ -45,6 +45,10 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             default: return false
             }
         }
+        var isUploading: Bool {
+            if case .uploading = self { return true }
+            return false
+        }
         /// 0…1 for a progress bar; nil where there is nothing meaningful to show.
         var fraction: Double? {
             switch self {
@@ -177,6 +181,8 @@ final class UploadQueue: ObservableObject {
     @Published private(set) var haltReason: String?
     /// Non-nil while the selected connection policy does not permit uploads.
     @Published private(set) var networkPauseReason: String?
+    /// Non-nil while the selected charging / battery policy pauses uploads.
+    @Published private(set) var powerPauseReason: String?
     /// Set when iOS ends a background execution window before the queue drains.
     @Published private(set) var systemPauseReason: String?
     /// Set while Google refuses requests for going over its per-minute limit
@@ -221,8 +227,21 @@ final class UploadQueue: ObservableObject {
     /// session's per-host connection limit is fixed when that session is
     /// created — going wider than that limit would not widen the transfers.
     static let concurrencyRange = 1...10
+    /// How many prepared uploads a background window may hand to iOS's
+    /// background URL session at once while keeping local export/hashing at
+    /// `maxConcurrent` (2). Fits within `httpMaximumConnectionsPerHost` (10).
+    static let backgroundTransferSlotLimit = 8
+    /// Soft cap on staged bytes across background transfers handed to iOS at
+    /// once, so a short window cannot fill the disk preparing huge videos.
+    /// Always permits at least one item even when a single video exceeds this.
+    static let backgroundStagingByteBudget: Int64 = 512 * 1024 * 1024
 
     private(set) var maxConcurrent: Int
+    /// When non-nil, rows actively transferring in iOS's background URLSession
+    /// count against this transfer cap (and `backgroundStagingByteLimit`)
+    /// rather than occupying one of the `maxConcurrent` local export/hash slots.
+    private(set) var maxBackgroundTransfers: Int?
+    private var backgroundStagingByteLimit: Int64 = UploadQueue.backgroundStagingByteBudget
     let maxAttempts: Int
     private let worker: UploadWorker
     private let sleeper: @Sendable (Double) async -> Void
@@ -388,6 +407,7 @@ final class UploadQueue: ObservableObject {
         haltReason
             ?? (isUserPaused ? "You paused backup. Tap Resume to continue." : nil)
             ?? networkPauseReason
+            ?? powerPauseReason
             ?? systemPauseReason
             ?? rateLimitPauseReason
     }
@@ -553,6 +573,18 @@ final class UploadQueue: ObservableObject {
         guard clamped != maxConcurrent else { return }
         maxConcurrent = clamped
         objectWillChange.send()
+        pump()
+    }
+
+    /// Decouple background URLSession transfer slots from local export/hash
+    /// slots (`maxConcurrent`) so a short background window can prepare a
+    /// bounded batch and hand them to `nsurlsessiond` without waiting for each
+    /// network upload to finish first. Pass `nil` to return to coupled slots.
+    func setBackgroundTransferLimit(_ limit: Int?, stagingByteBudget: Int64 = backgroundStagingByteBudget) {
+        let clamped = limit.map { Self.clampedConcurrency($0) }
+        guard clamped != maxBackgroundTransfers || stagingByteBudget != backgroundStagingByteLimit else { return }
+        maxBackgroundTransfers = clamped
+        backgroundStagingByteLimit = max(0, stagingByteBudget)
         pump()
     }
 
@@ -832,6 +864,43 @@ final class UploadQueue: ObservableObject {
         return marked + enqueued
     }
 
+    /// Merge exported completion ledger keys into the connected account's
+    /// durable history (issue #34), dropping any non-running queued/failed
+    /// rows whose source is now known backed up. Returns how many new keys
+    /// were added.
+    @discardableResult
+    func importCompletedSourceKeys(_ keys: [String]) -> Int {
+        let fresh = Array(Set(keys.filter { !$0.isEmpty && !completedSourceKeys.contains($0) })).sorted()
+        guard !fresh.isEmpty else { return 0 }
+        completedSourceKeys.formUnion(fresh)
+        if let accountIdentifier, let persistence, persistence.storesCompletionLedgerSeparately {
+            do {
+                try persistence.recordCompletedSourceKeys(fresh, for: accountIdentifier)
+                if completionLedgerHealthy { persistenceWarning = nil }
+            } catch {
+                completionLedgerHealthy = false
+                persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
+            }
+        }
+        let freshSet = Set(fresh)
+        var dropped = 0
+        items.removeAll { item in
+            guard running[item.id] == nil,
+                  let key = item.source.queueDeduplicationKey,
+                  freshSet.contains(key) else { return false }
+            dropped += 1
+            return true
+        }
+        if dropped > 0 { rebuildDerivedState() }
+        persistNow()
+        DiagnosticEventLog.shared.record(
+            "queue",
+            "Imported \(fresh.count) backed-up history record\(fresh.count == 1 ? "" : "s")"
+                + (dropped > 0 ? " and removed \(dropped) matching queued item\(dropped == 1 ? "" : "s")" : "")
+        )
+        return fresh.count
+    }
+
     /// Select and restore the durable queue for the connected account. A queue
     /// is never reused for a different Google account.
     func activateAccount(_ identifier: String?) {
@@ -957,6 +1026,21 @@ final class UploadQueue: ObservableObject {
         else { cancelRunningForRequeue(includingBackgroundTransfers: true) }
     }
 
+    /// Apply the user-selected charging / battery policy (issue #14). Pauses
+    /// new work and requeues local preparation without cancelling transfers
+    /// already handed off to iOS.
+    func setPowerAccess(allowed: Bool, pauseReason: String? = nil) {
+        let nextReason = allowed ? nil : (pauseReason ?? "Paused by battery settings")
+        guard powerPauseReason != nextReason else { return }
+        powerPauseReason = nextReason
+        DiagnosticEventLog.shared.record(
+            "queue",
+            allowed ? "Power policy allows uploads" : "Power policy paused uploads: \(nextReason ?? "unknown")"
+        )
+        if allowed { pump() }
+        else { cancelRunningForRequeue(includingBackgroundTransfers: false) }
+    }
+
     /// Arm the crash-loop guard while the app executes with iOS's blessing —
     /// open, or inside a background window — and disarm it when the process is
     /// about to be suspended. A suspended process can be killed at any moment
@@ -1032,12 +1116,38 @@ final class UploadQueue: ObservableObject {
         while !isIdle {
             if Task.isCancelled { return false }
             if let deadline, Date() >= deadline { return false }
-            if networkPauseReason != nil || systemPauseReason != nil { return false }
+            if networkPauseReason != nil || powerPauseReason != nil || systemPauseReason != nil { return false }
             if isUserPaused && running.isEmpty { return false }
             if running.isEmpty && !hasWorkableItems {
                 return haltReason == nil
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return haltReason == nil
+    }
+
+    /// For short background windows (`BGAppRefreshTask`, Shortcuts, location
+    /// wakes): prepare and hand off uploads to iOS's background URLSession,
+    /// returning as soon as the queue settles OR the background transfer cap /
+    /// staging byte budget is full with no local preparations still running.
+    func waitUntilBackgroundHandoff(until deadline: Date? = nil) async -> Bool {
+        while !isIdle {
+            if Task.isCancelled { return false }
+            if let deadline, Date() >= deadline { return false }
+            if networkPauseReason != nil || powerPauseReason != nil || systemPauseReason != nil { return false }
+            if isUserPaused && running.isEmpty { return false }
+            if running.isEmpty && !hasWorkableItems {
+                return haltReason == nil
+            }
+            if let transferLimit = maxBackgroundTransfers {
+                let stats = runningSlotCounts()
+                let budgetFull = stats.inBackgroundTransfer >= transferLimit
+                    || (stats.inBackgroundTransfer > 0 && stats.stagedBytes >= backgroundStagingByteLimit)
+                if budgetFull && stats.localActive == 0 {
+                    return haltReason == nil
+                }
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
         }
         return haltReason == nil
     }
@@ -1053,7 +1163,7 @@ final class UploadQueue: ObservableObject {
             guard let prepared = item.checkpoint?.prepared else { return false }
             return prepared.receipt != nil || (running[item.id] != nil && item.state.isWorking)
         }) {
-            if let reason = networkPauseReason ?? systemPauseReason {
+            if let reason = networkPauseReason ?? powerPauseReason ?? systemPauseReason {
                 DiagnosticEventLog.shared.record("queue", "Stopped waiting for upload confirmations: \(reason)")
                 return
             }
@@ -1073,10 +1183,37 @@ final class UploadQueue: ObservableObject {
 
     // MARK: - Scheduling
 
+    private func runningSlotCounts() -> (localActive: Int, inBackgroundTransfer: Int, stagedBytes: Int64) {
+        var inBackgroundTransfer = 0
+        var stagedBytes: Int64 = 0
+        for id in running.keys {
+            guard let index = indexByID[id] else { continue }
+            let item = items[index]
+            if item.checkpoint?.isBackgroundTransfer == true, item.state.isUploading {
+                inBackgroundTransfer += 1
+                stagedBytes += max(0, item.checkpoint?.byteCount ?? item.byteCount)
+            }
+        }
+        return (running.count - inBackgroundTransfer, inBackgroundTransfer, stagedBytes)
+    }
+
+    private func canStartAnotherRow() -> Bool {
+        guard let transferLimit = maxBackgroundTransfers else {
+            return running.count < maxConcurrent
+        }
+        let stats = runningSlotCounts()
+        guard stats.localActive < maxConcurrent else { return false }
+        guard stats.inBackgroundTransfer < transferLimit else { return false }
+        if stats.inBackgroundTransfer > 0, stats.stagedBytes >= backgroundStagingByteLimit {
+            return false
+        }
+        return true
+    }
+
     private func pump() {
-        guard haltReason == nil, networkPauseReason == nil, systemPauseReason == nil,
-              rateLimitPauseReason == nil else { return }
-        while running.count < maxConcurrent, let index = nextStartableIndex() {
+        guard haltReason == nil, networkPauseReason == nil, powerPauseReason == nil,
+              systemPauseReason == nil, rateLimitPauseReason == nil else { return }
+        while canStartAnotherRow(), let index = nextStartableIndex() {
             start(at: index)
         }
     }
@@ -1147,7 +1284,14 @@ final class UploadQueue: ObservableObject {
             persist()
         case .state(let state):
             guard !items[index].state.isFinished else { return }
+            let wasUploading = items[index].state.isUploading
             setState(state, at: index)
+            // Once a row has handed its file to iOS's background URLSession,
+            // it frees a local export/hash slot so the next item can prepare.
+            if maxBackgroundTransfers != nil, !wasUploading, state.isUploading,
+               items[index].checkpoint?.isBackgroundTransfer == true {
+                pump()
+            }
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
             if let checkpoint { items[index].editMark = checkpoint.editMark }

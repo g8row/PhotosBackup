@@ -127,6 +127,19 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.orange)
             }
+            Toggle("Only While Charging", isOn: $preferences.onlyWhileCharging)
+            if !preferences.onlyWhileCharging {
+                Picker("Minimum Battery", selection: $preferences.minimumBatteryPercent) {
+                    ForEach(PowerPolicy.minimumBatteryChoices, id: \.self) { level in
+                        Text(level == 0 ? "Off" : "\(level)%").tag(level)
+                    }
+                }
+            }
+            if let reason = queue.powerPauseReason {
+                Label(reason, systemImage: "battery.25")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
             Picker("Simultaneous Uploads", selection: $preferences.concurrentUploads) {
                 ForEach(Array(UploadQueue.concurrencyRange), id: \.self) { count in
                     Text(count.formatted()).tag(count)
@@ -189,10 +202,11 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Toggle("Wake on Location Change", isOn: $preferences.significantLocationWake)
         } header: {
             Text("Background")
         } footer: {
-            Text("iOS normally pauses the app seconds after you leave it, and backs up only when it grants a background window. With this on, the backup keeps going after you switch apps or lock the phone, two uploads at a time, until everything is backed up — then the app sleeps again. It uses more battery; leaving the phone charging works best. Start a backup with the app open; swiping the app away from the app switcher stops it. Each run stops itself after 12 hours.\n\nWith it off, the screen stays on while a backup runs with the app open, since locking the phone would pause it.")
+            Text("iOS normally pauses the app seconds after you leave it, and backs up only when it grants a background window. With Keep Running in Background on, the backup keeps going after you switch apps or lock the phone, two uploads at a time, until everything is backed up — then the app sleeps again. It uses more battery; leaving the phone charging works best. Start a backup with the app open; swiping the app away from the app switcher stops it. Each run stops itself after 12 hours.\n\nWake on Location Change (requires Always location permission) lets iOS wake the app when you travel or arrive home so new photos are discovered and handed off without opening the app. Coordinates are ignored.\n\nWith Keep Running in Background off, the screen stays on while a backup runs with the app open, since locking the phone would pause it.")
         }
     }
 

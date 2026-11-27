@@ -53,6 +53,11 @@ without a desktop companion or hosted service.
 - Choose how many uploads run at once, from 1 to 10.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
   cancelling in-flight background transfers when the allowed transport is lost.
+- Optionally limit backups to **Only While Charging** or above a **Minimum
+  Battery** percentage (**Settings → Backup**).
+- Export and import backup history (completion ledger and Google album links,
+  without credentials or media) in **Settings → Storage**, so reinstalling or
+  switching signing certificates does not require re-checking the whole library.
 - Keep backing up after you leave the app, on iOS 26 and later. While the app
   is open with work queued, it asks iOS to continue that work in the
   background; iOS shows the progress in a Live Activity, where it can be
@@ -63,7 +68,14 @@ without a desktop companion or hosted service.
   location updates), so the backup carries on with the app closed or the phone
   locked. It stops when the queue is done, after 12 hours, or when iOS
   interrupts it, and the app is suspended again.
-- Request recurring iOS background-processing windows for selected-album backup.
+- Optionally enable **Wake on Location Change** (**Settings → Background**,
+  requires Always location permission) so iOS wakes the app when travelling or
+  arriving home to discover new photos and hand them to the background upload
+  session.
+- Request recurring iOS background-processing and background-refresh windows
+  for selected-album backup, handing a bounded batch of prepared transfers to
+  the background `URLSession` while keeping local preparation at 2 concurrent
+  items.
 - Expose a **Back Up Photos** Shortcuts action on iOS 16+ for charger,
   time-of-day, Wi-Fi, and other personal automations. It runs even with
   Automatic Backup off, so a schedule of your choosing can replace it.
@@ -89,8 +101,8 @@ The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
 Latest release: **0.4.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-Every push and pull request runs the suite on an iPhone simulator: 227 tests,
-225 pass, 0 fail. The 2 opt-in live tests are skipped.
+Every push and pull request runs the suite on an iPhone simulator: 236 tests,
+234 pass, 0 fail. The 2 opt-in live tests are skipped.
 
 Each release's `.ipa` is built by GitHub Actions from the tagged commit and
 attached with its SHA-256, so the binary can be checked against the source it
@@ -101,7 +113,8 @@ claims to come from.
 | Piece | Value |
 | --- | --- |
 | App bundle ID | `com.g8row.photosbackup` |
-| Background task | `com.g8row.photosbackup.background-backup` |
+| Background processing task | `com.g8row.photosbackup.background-backup` |
+| Background refresh task | `com.g8row.photosbackup.background-refresh` |
 | Continued backup (iOS 26+) | `<bundle ID>.continued-backup.<UUID>`, permitted by `<bundle ID>.continued-backup.*` |
 | Background upload session | `com.g8row.photosbackup.background-upload` |
 

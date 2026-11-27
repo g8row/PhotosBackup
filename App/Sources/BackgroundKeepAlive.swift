@@ -271,7 +271,9 @@ final class BackgroundKeepAlive: NSObject {
         manager.distanceFilter = CLLocationDistanceMax
         manager.pausesLocationUpdatesAutomatically = false
         manager.allowsBackgroundLocationUpdates = true
-        manager.showsBackgroundLocationIndicator = true
+        // Apple requires the blue indicator for When-In-Use background updates;
+        // when the user has granted Always, hide it just like SideStore does.
+        manager.showsBackgroundLocationIndicator = manager.authorizationStatus != .authorizedAlways
         manager.startUpdatingLocation()
         locationManager = manager
     }
@@ -319,6 +321,80 @@ enum KeepAliveError: LocalizedError {
         case .audioDidNotStart: return "iOS would not start the silent audio"
         case .locationNotYetAllowed: return "location access has not been granted yet"
         case .locationDenied: return "location access is off for this app in Settings"
+        }
+    }
+}
+
+/// Optional significant-location-change monitor (arrival home / travel) that
+/// lets iOS wake the app in the background to discover and hand off new photos
+/// even when the app has not been opened recently. Coordinates are ignored.
+@MainActor
+final class SignificantLocationWakeMonitor: NSObject {
+    var onLocationWake: (() -> Void)?
+    var onAuthorizationChange: ((CLAuthorizationStatus) -> Void)?
+
+    private(set) var isMonitoring = false
+    private var manager: CLLocationManager?
+
+    var authorizationStatus: CLAuthorizationStatus {
+        (manager ?? CLLocationManager()).authorizationStatus
+    }
+
+    func requestAlwaysAuthorizationIfNeeded() {
+        let manager = ensureManager()
+        let status = manager.authorizationStatus
+        if status == .notDetermined || status == .authorizedWhenInUse {
+            manager.requestAlwaysAuthorization()
+        }
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard enabled else {
+            if isMonitoring {
+                manager?.stopMonitoringSignificantLocationChanges()
+                isMonitoring = false
+                DiagnosticEventLog.shared.record("location", "Stopped significant-location wake monitoring")
+            }
+            return
+        }
+        guard CLLocationManager.significantLocationChangeMonitoringAvailable() else { return }
+        let manager = ensureManager()
+        guard manager.authorizationStatus == .authorizedAlways else {
+            if isMonitoring {
+                manager.stopMonitoringSignificantLocationChanges()
+                isMonitoring = false
+            }
+            return
+        }
+        guard !isMonitoring else { return }
+        manager.allowsBackgroundLocationUpdates = true
+        manager.startMonitoringSignificantLocationChanges()
+        isMonitoring = true
+        DiagnosticEventLog.shared.record("location", "Enabled significant-location wake monitoring for unattended photo discovery")
+    }
+
+    private func ensureManager() -> CLLocationManager {
+        if let manager { return manager }
+        let created = CLLocationManager()
+        created.delegate = self
+        manager = created
+        return created
+    }
+}
+
+extension SignificantLocationWakeMonitor: CLLocationManagerDelegate {
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        Task { @MainActor [weak self] in
+            self?.onLocationWake?()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        Task { @MainActor [weak self] in
+            self?.onAuthorizationChange?(status)
         }
     }
 }

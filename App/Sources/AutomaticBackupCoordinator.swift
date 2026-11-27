@@ -24,6 +24,15 @@ final class AutomaticBackupCoordinator: ObservableObject {
     nonisolated static func resolveTaskIdentifier(permitted: [String]) -> String {
         permitted.first { $0.hasSuffix(".background-backup") && !$0.hasSuffix("*") } ?? builtTaskIdentifier
     }
+
+    nonisolated static let refreshTaskIdentifier: String = resolveRefreshTaskIdentifier(
+        permitted: Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+    )
+    nonisolated static let builtRefreshTaskIdentifier = "com.g8row.photosbackup.background-refresh"
+
+    nonisolated static func resolveRefreshTaskIdentifier(permitted: [String]) -> String {
+        permitted.first { $0.hasSuffix(".background-refresh") && !$0.hasSuffix("*") } ?? builtRefreshTaskIdentifier
+    }
     private nonisolated static let logger = Logger(subsystem: "com.g8row.photosbackup", category: "automatic-backup")
 
     /// How many sources one background enqueue pass may append. This bounds
@@ -51,6 +60,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// requeue unfinished work and return the dialog.
     static let shortcutBudget: TimeInterval = 22
 
+    /// Budget for a short `BGAppRefreshTask` or significant-location wake:
+    /// scan for new photos and hand prepared PUTs to `nsurlsessiond`.
+    static let refreshBudget: TimeInterval = 20
+
+    /// Minimum gap between significant-location-change background wakes.
+    private static let minimumLocationWakeInterval: TimeInterval = 15 * 60
+
     /// When the pending processing request was submitted, so the log can say
     /// how long iOS took to honour it.
     static let lastRequestSubmittedKey = "diagnostics.scheduler.lastSubmittedAt"
@@ -69,9 +85,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private let preferences: BackupPreferences
     private let albums: PhotoAlbumStore
     private let network: NetworkPolicyMonitor
+    private let power: PowerPolicyMonitor
     private let libraryChanges: PhotoLibraryChangeTracker
 
     private var registered = false
+    private var refreshRegistered = false
     private var ranForegroundBackup = false
     private var isForeground = true
     private var shouldRunAfterActivation = false
@@ -79,6 +97,8 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private var backgroundRunID: UUID?
     private var foregroundOperation: Task<Void, Never>?
     private var foregroundRunID: UUID?
+    private let locationWake = SignificantLocationWakeMonitor()
+    private var lastLocationWakeAt = Date.distantPast
     /// The scheduling outcome last written to the event log. `updateSchedule`
     /// runs on every background transition, and logging each resubmission would
     /// push the entries a report needs out of the timeline.
@@ -122,6 +142,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
          preferences: BackupPreferences,
          albums: PhotoAlbumStore,
          network: NetworkPolicyMonitor,
+         power: PowerPolicyMonitor? = nil,
          libraryChanges: PhotoLibraryChangeTracker? = nil) {
         self.photos = photos
         self.account = account
@@ -129,6 +150,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         self.preferences = preferences
         self.albums = albums
         self.network = network
+        self.power = power ?? PowerPolicyMonitor()
         self.libraryChanges = libraryChanges ?? PhotoLibraryChangeTracker()
         queue.followUpSources = { [weak self] source in
             self?.followUps(after: source) ?? []
@@ -149,6 +171,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 Task { @MainActor [weak self] in self?.refreshKeepAlive() }
             }
 
+        locationWake.onLocationWake = { [weak self] in self?.handleSignificantLocationWake() }
+        locationWake.onAuthorizationChange = { [weak self] _ in self?.updateSignificantLocationWake() }
+
         registered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.taskIdentifier,
             using: nil
@@ -165,6 +190,18 @@ final class AutomaticBackupCoordinator: ObservableObject {
             task.expirationHandler = { window.expire() }
             Task { @MainActor [weak self] in self?.begin(task, window: window) }
         }
+        refreshRegistered = BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: Self.refreshTaskIdentifier,
+            using: nil
+        ) { [weak self] task in
+            guard let task = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            let window = BackgroundWindow()
+            task.expirationHandler = { window.expire() }
+            Task { @MainActor [weak self] in self?.beginRefresh(task, window: window) }
+        }
         let declared = (Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? [])
             .joined(separator: ", ")
         if !registered {
@@ -174,7 +211,12 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 level: .error
             )
         } else {
-            DiagnosticEventLog.shared.record("scheduler", "Registered the background task handler for \(Self.taskIdentifier); Info.plist declares \(declared)")
+            DiagnosticEventLog.shared.record(
+                "scheduler",
+                "Registered background task handlers (\(Self.taskIdentifier)"
+                    + (refreshRegistered ? ", \(Self.refreshTaskIdentifier)" : "")
+                    + "); Info.plist declares \(declared)"
+            )
         }
     }
 
@@ -188,7 +230,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
         await queueVideoOriginals()
         await queueLivePhotoMotion()
         applyNetworkPolicy()
+        applyPowerPolicy()
         updateSchedule()
+        updateSignificantLocationWake()
         runForegroundBackupIfNeeded()
         refreshContinuedBackup()
         refreshKeepAlive()
@@ -204,10 +248,34 @@ final class AutomaticBackupCoordinator: ObservableObject {
         runForegroundBackupIfNeeded()
     }
 
+    func powerDidChange() {
+        applyPowerPolicy()
+        runForegroundBackupIfNeeded()
+    }
+
+    func powerPreferenceDidChange() {
+        applyPowerPolicy()
+        updateSchedule()
+        runForegroundBackupIfNeeded()
+    }
+
+    func significantLocationWakePreferenceDidChange() {
+        if preferences.significantLocationWake {
+            locationWake.requestAlwaysAuthorizationIfNeeded()
+        }
+        updateSignificantLocationWake()
+    }
+
+    private func updateSignificantLocationWake() {
+        let shouldMonitor = preferences.significantLocationWake && scheduleBlocker == nil
+        locationWake.setEnabled(shouldMonitor)
+    }
+
     func backupConfigurationDidChange() {
         cancelForegroundScan()
         ranForegroundBackup = false
         updateSchedule()
+        updateSignificantLocationWake()
         runForegroundBackupIfNeeded()
     }
 
@@ -216,6 +284,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         ranForegroundBackup = false
         queue.activateAccount(account.status.email)
         updateSchedule()
+        updateSignificantLocationWake()
         runForegroundBackupIfNeeded()
         Task {
             await queueEditedVersionsOnce()
@@ -415,6 +484,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     func applicationDidBecomeActive() {
         isForeground = true
         finishContinuedRun(success: true, ending: "the app was opened")
+        queue.setBackgroundTransferLimit(nil)
         queue.setMaxConcurrent(preferences.concurrentUploads)
         queue.setPreparationGuardArmed(true)
         queue.setICloudDownloadsAllowed(true)
@@ -438,8 +508,18 @@ final class AutomaticBackupCoordinator: ObservableObject {
         queue.setNetworkAccess(allowed: decision.allowsUploads, pauseReason: decision.pauseReason)
     }
 
+    func applyPowerPolicy() {
+        let decision = PowerPolicy.decision(
+            onlyWhileCharging: preferences.onlyWhileCharging,
+            minimumBatteryPercent: preferences.minimumBatteryPercent,
+            status: power.status
+        )
+        queue.setPowerAccess(allowed: decision.allowsUploads, pauseReason: decision.pauseReason)
+    }
+
     func updateSchedule() {
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.taskIdentifier)
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.refreshTaskIdentifier)
         guard registered else {
             noteSchedule("unregistered", "No background window requested: the task handler is not registered", level: .error)
             return
@@ -451,20 +531,27 @@ final class AutomaticBackupCoordinator: ObservableObject {
 
         let request = BGProcessingTaskRequest(identifier: Self.taskIdentifier)
         request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
+        request.requiresExternalPower = preferences.onlyWhileCharging
         request.earliestBeginDate = Date(timeIntervalSinceNow: Self.processingRequestDelay)
         do {
             try BGTaskScheduler.shared.submit(request)
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRequestSubmittedKey)
             Self.logger.info("Scheduled the next automatic-backup processing request")
+            let powerDetail = preferences.onlyWhileCharging ? ", while charging" : ""
             noteSchedule(
-                "scheduled",
-                "Requested a background processing window: earliest in 15 minutes, with a network connection. iOS chooses the actual time, often overnight while charging."
+                "scheduled:\(preferences.onlyWhileCharging)",
+                "Requested a background processing window: earliest in 15 minutes, with a network connection\(powerDetail). iOS chooses the actual time, often overnight while charging."
             )
         } catch {
             let explanation = Self.explainSchedulingError(error)
             Self.logger.error("Could not schedule automatic backup: \(explanation, privacy: .public)")
             noteSchedule("failed: \(explanation)", "Could not request a background window: \(explanation)", level: .error)
+        }
+
+        if refreshRegistered {
+            let refresh = BGAppRefreshTaskRequest(identifier: Self.refreshTaskIdentifier)
+            refresh.earliestBeginDate = Date(timeIntervalSinceNow: Self.processingRequestDelay)
+            try? BGTaskScheduler.shared.submit(refresh)
         }
     }
 
@@ -545,7 +632,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
               shouldSchedule,
               !queue.isUserPaused,
               account.status.isUsable,
-              preferences.connection.decision(for: network.status).allowsUploads else { return }
+              preferences.connection.decision(for: network.status).allowsUploads,
+              PowerPolicy.decision(onlyWhileCharging: preferences.onlyWhileCharging,
+                                   minimumBatteryPercent: preferences.minimumBatteryPercent,
+                                   status: power.status).allowsUploads else { return }
 
         ranForegroundBackup = true
         let runID = UUID()
@@ -623,7 +713,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// Any condition that stops the queue starting new work. Polling past one
     /// of these makes no progress and only keeps the main actor awake.
     private var isPausedForAnyReason: Bool {
-        queue.isUserPaused || queue.networkPauseReason != nil || queue.systemPauseReason != nil
+        queue.isUserPaused || queue.networkPauseReason != nil || queue.powerPauseReason != nil || queue.systemPauseReason != nil
     }
 
     /// The result of a manual "Back Up Now" or "Re-check Backups", so the UI can
@@ -840,10 +930,149 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// before the window is handed back without it.
     static let expirationGrace: UInt64 = 3_000_000_000
 
-    /// A background process keeps the load it can hold, as a continued backup
-    /// does. Returning to the app restores the chosen number.
+    /// A background process keeps local export/hashing at 2 while allowing up
+    /// to `UploadQueue.backgroundTransferSlotLimit` prepared files to stream
+    /// concurrently inside `nsurlsessiond`. Returning to the app restores the
+    /// user's chosen concurrency.
     private func capBackgroundConcurrency() {
         queue.setMaxConcurrent(min(preferences.concurrentUploads, ContinuedBackupPolicy.backgroundConcurrencyLimit))
+        queue.setBackgroundTransferLimit(UploadQueue.backgroundTransferSlotLimit)
+    }
+
+    /// Short `BGAppRefreshTask` window (Immich pattern): scan for new photos
+    /// and hand prepared PUTs to `nsurlsessiond` within 20 s, giving time back
+    /// immediately if a `BGProcessingTask` is already running.
+    private func beginRefresh(_ task: BGAppRefreshTask, window: BackgroundWindow) {
+        if backgroundOperation != nil {
+            DiagnosticEventLog.shared.record("scheduler", "iOS granted a background refresh window while a processing window was running, so it yielded to that window")
+            task.setTaskCompleted(success: true)
+            return
+        }
+        DiagnosticEventLog.shared.record("scheduler", "iOS started a short background refresh window")
+        AppSessionTracker.note(.backgroundWork)
+        let run = AutomaticBackupRunHistory.started(.backgroundRefresh, context: executionContext())
+        let startedAt = Date()
+        isForeground = false
+        if !continuesInBackground { capBackgroundConcurrency() }
+        loggedScheduleState = nil
+        updateSchedule()
+        queue.setPreparationGuardArmed(true)
+        if !continuesInBackground { queue.setICloudDownloadsAllowed(false) }
+        queue.resumeSystemWork()
+        let runID = UUID()
+        backgroundRunID = runID
+        let completion = BackgroundTaskCompletion()
+
+        let operation = Task { @MainActor [weak self, weak task] in
+            guard let self else {
+                if completion.claim() { task?.setTaskCompleted(success: false) }
+                return
+            }
+            let report = await self.performBackgroundBackup(
+                settlementDeadline: startedAt.addingTimeInterval(Self.refreshBudget),
+                handoffOnly: true
+            )
+            let keepsRunning = self.isForeground || self.continuesInBackground
+            if !keepsRunning, !self.queue.isIdle {
+                self.queue.suspendForBackgroundExpiration()
+            }
+            AutomaticBackupRunHistory.finished(run, success: report.success, summary: report.summary)
+            self.queue.setPreparationGuardArmed(keepsRunning)
+            if !keepsRunning { AppSessionTracker.note(.background) }
+            DiagnosticEventLog.shared.flush()
+            if self.backgroundRunID == runID {
+                self.backgroundOperation = nil
+                self.backgroundRunID = nil
+            }
+            guard completion.claim() else { return }
+            task?.expirationHandler = nil
+            task?.setTaskCompleted(success: report.success)
+        }
+        backgroundOperation = operation
+        let expire: @Sendable () -> Void = { [weak self, weak task] in
+            let elapsed = Int(Date().timeIntervalSince(startedAt).rounded())
+            DiagnosticEventLog.shared.record(
+                "scheduler",
+                "iOS ended the background refresh window after \(elapsed) s; unfinished work stays queued",
+                level: .warning
+            )
+            DiagnosticEventLog.shared.flush()
+            operation.cancel()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + .nanoseconds(Int(Self.expirationGrace))
+            ) { [weak task] in
+                guard completion.claim() else { return }
+                DiagnosticEventLog.shared.flush()
+                task?.expirationHandler = nil
+                task?.setTaskCompleted(success: false)
+            }
+            Task { @MainActor [weak self] in
+                guard let self, !self.continuesInBackground else { return }
+                self.queue.suspendForBackgroundExpiration()
+                AppSessionTracker.note(.background)
+                DiagnosticEventLog.shared.flush()
+            }
+        }
+        task.expirationHandler = expire
+        window.adopt(expire)
+    }
+
+    /// Triggered by `SignificantLocationWakeMonitor` when the user moves a
+    /// significant distance (e.g., arriving home). Spends a short background
+    /// task scanning for new photos and handing prepared PUTs to `nsurlsessiond`.
+    private func handleSignificantLocationWake() {
+        guard preferences.significantLocationWake,
+              UIApplication.shared.applicationState != .active,
+              !continuesInBackground,
+              backgroundOperation == nil,
+              scheduleBlocker == nil else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastLocationWakeAt) >= Self.minimumLocationWakeInterval else { return }
+        lastLocationWakeAt = now
+
+        let taskBox = BackgroundTaskBox()
+        let completion = BackgroundTaskCompletion()
+        let endTask: @Sendable () -> Void = {
+            guard completion.claim() else { return }
+            Task { @MainActor in
+                let id = taskBox.take()
+                if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+            }
+        }
+        let runID = UUID()
+        backgroundRunID = runID
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { endTask(); return }
+            let run = AutomaticBackupRunHistory.started(.locationWake, context: self.executionContext())
+            self.isForeground = false
+            self.capBackgroundConcurrency()
+            AppSessionTracker.note(.backgroundWork)
+            self.queue.setPreparationGuardArmed(true)
+            self.queue.setICloudDownloadsAllowed(false)
+            self.queue.resumeSystemWork()
+            let report = await self.performBackgroundBackup(
+                settlementDeadline: Date().addingTimeInterval(Self.refreshBudget),
+                handoffOnly: true
+            )
+            let keepsRunning = self.isForeground || self.continuesInBackground
+            if !keepsRunning, !self.queue.isIdle {
+                self.queue.suspendForBackgroundExpiration()
+            }
+            AutomaticBackupRunHistory.finished(run, success: report.success, summary: report.summary)
+            self.queue.setPreparationGuardArmed(keepsRunning)
+            if !keepsRunning { AppSessionTracker.note(.background) }
+            DiagnosticEventLog.shared.flush()
+            if self.backgroundRunID == runID {
+                self.backgroundOperation = nil
+                self.backgroundRunID = nil
+            }
+            endTask()
+        }
+        backgroundOperation = operation
+        taskBox.set(UIApplication.shared.beginBackgroundTask(withName: "PhotosBackup.LocationWake") {
+            operation.cancel()
+            endTask()
+        })
     }
 
     static func describeInterval(_ seconds: TimeInterval) -> String {
@@ -902,12 +1131,14 @@ final class AutomaticBackupCoordinator: ObservableObject {
     ///     carries on with the queue anyway.
     private func performBackgroundBackup(settlementDeadline: Date? = nil,
                                          requiresAutomaticBackup: Bool = true,
-                                         waitsForUploads: Bool = true) async -> BackgroundRunReport {
+                                         waitsForUploads: Bool = true,
+                                         handoffOnly: Bool = false) async -> BackgroundRunReport {
         await photos.start()
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         _ = await network.waitForInitialStatus()
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         applyNetworkPolicy()
+        applyPowerPolicy()
 
         // A user pause is durable and must not be bypassed by a scheduled run.
         guard !queue.isUserPaused else {
@@ -922,6 +1153,15 @@ final class AutomaticBackupCoordinator: ObservableObject {
             return finish(.init(success: false,
                                 summary: decision.pauseReason ?? "The connection policy does not allow uploads"))
         }
+        let powerDecision = PowerPolicy.decision(
+            onlyWhileCharging: preferences.onlyWhileCharging,
+            minimumBatteryPercent: preferences.minimumBatteryPercent,
+            status: power.status
+        )
+        guard powerDecision.allowsUploads else {
+            return finish(.init(success: true,
+                                summary: powerDecision.pauseReason ?? "Paused by battery settings"))
+        }
 
         await albums.refresh()
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
@@ -934,9 +1174,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // handle), so without this a network blip parks those items forever.
         let released = queue.retryRetryableFailures()
         let failuresBefore = queue.failedCount
-        let scan = libraryChanges.scan(albums: albums,
-                                       selectedAlbumIDs: preferences.selectedAlbumIDs,
-                                       accountIdentifier: account.status.email)
+        let scan = await libraryChanges.scan(albums: albums,
+                                             selectedAlbumIDs: preferences.selectedAlbumIDs,
+                                             accountIdentifier: account.status.email)
+        if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         // An edited asset already has a completion recorded against its
         // identifier, so the dedup below would drop it. Release those first;
         // the worker's hash lookup still short-circuits anything whose bytes
@@ -954,7 +1195,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let backedUpBefore = queue.completedSourceCount
         let settled: Bool
         if waitsForUploads {
-            settled = await queue.waitUntilSettled(until: settlementDeadline)
+            settled = handoffOnly
+                ? await queue.waitUntilBackgroundHandoff(until: settlementDeadline)
+                : await queue.waitUntilSettled(until: settlementDeadline)
         } else {
             settled = true
         }
@@ -1034,7 +1277,8 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let report = await performBackgroundBackup(
             settlementDeadline: startedAt.addingTimeInterval(Self.shortcutBudget),
             requiresAutomaticBackup: false,
-            waitsForUploads: !appActive
+            waitsForUploads: !appActive,
+            handoffOnly: !appActive
         )
         // In the background the process is suspended once the action returns.
         // Requeue whatever has not reached iOS's transfer service, so it resumes
@@ -1185,7 +1429,8 @@ extension AutomaticBackupCoordinator {
             userPaused: queue.isUserPaused,
             halted: queue.haltReason != nil,
             networkPaused: queue.networkPauseReason != nil,
-            systemPaused: queue.systemPauseReason != nil
+            systemPaused: queue.systemPauseReason != nil,
+            powerPaused: queue.powerPauseReason != nil
         )
     }
 
@@ -1546,6 +1791,25 @@ final class BackgroundTaskCompletion: @unchecked Sendable {
         guard !claimed else { return false }
         claimed = true
         return true
+    }
+}
+
+private final class BackgroundTaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    func set(_ id: UIBackgroundTaskIdentifier) {
+        lock.lock()
+        self.id = id
+        lock.unlock()
+    }
+
+    func take() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = id
+        id = .invalid
+        return current
     }
 }
 

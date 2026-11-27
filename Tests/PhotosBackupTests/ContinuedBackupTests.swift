@@ -5,9 +5,9 @@ final class ContinuedBackupTests: XCTestCase {
 
     func testTheTaskContinuesOnlyWhileTheQueueCanMoveOnItsOwn() {
         func decide(workable: Bool = true, user: Bool = false, halted: Bool = false,
-                    network: Bool = false, system: Bool = false) -> Bool {
+                    network: Bool = false, system: Bool = false, power: Bool = false) -> Bool {
             ContinuedBackupPolicy.shouldContinue(hasWorkableItems: workable, userPaused: user, halted: halted,
-                                                 networkPaused: network, systemPaused: system)
+                                                 networkPaused: network, systemPaused: system, powerPaused: power)
         }
         XCTAssertTrue(decide())
         XCTAssertFalse(decide(workable: false), "nothing left, or only rows waiting for iCloud")
@@ -15,6 +15,7 @@ final class ContinuedBackupTests: XCTestCase {
         XCTAssertFalse(decide(halted: true), "the account needs the user")
         XCTAssertFalse(decide(network: true), "no allowed connection")
         XCTAssertFalse(decide(system: true))
+        XCTAssertFalse(decide(power: true), "waiting for charger or minimum battery")
     }
 
     /// A processing window ends once: either the run finishes or the expiry
@@ -67,10 +68,23 @@ final class ContinuedBackupTests: XCTestCase {
         // As SideStore would rename it: the build-time entry is the one left.
         XCTAssertEqual(ContinuedBackupPolicy.identifierPrefixes(bundleIdentifier: id + ".TEAMID", permitted: permitted),
                        [id + ".continued-backup."])
-        // No entry may cover the processing task's identifier: with one, iOS
-        // refused to register that task's handler.
+        // No entry may cover the processing or refresh task's identifier: with
+        // one, iOS refused to register that task's handler.
         let processing = AutomaticBackupCoordinator.taskIdentifier
+        let refresh = AutomaticBackupCoordinator.refreshTaskIdentifier
+        XCTAssertTrue(permitted.contains(refresh))
         XCTAssertFalse(permitted.contains { $0.hasSuffix("*") && processing.hasPrefix(String($0.dropLast())) })
+        XCTAssertFalse(permitted.contains { $0.hasSuffix("*") && refresh.hasPrefix(String($0.dropLast())) })
+    }
+
+    func testTheRefreshTaskUsesTheIdentifierThisInstallDeclares() {
+        XCTAssertEqual(AutomaticBackupCoordinator.resolveRefreshTaskIdentifier(permitted: [
+            "com.g8row.photosbackup.TEAM.background-backup",
+            "com.g8row.photosbackup.TEAM.background-refresh",
+            "com.g8row.photosbackup.TEAM.continued-backup.*",
+        ]), "com.g8row.photosbackup.TEAM.background-refresh")
+        XCTAssertEqual(AutomaticBackupCoordinator.resolveRefreshTaskIdentifier(permitted: []),
+                       AutomaticBackupCoordinator.builtRefreshTaskIdentifier)
     }
 
     /// SideStore rewrites the declared identifiers to its renamed bundle; the

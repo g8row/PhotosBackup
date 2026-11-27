@@ -36,6 +36,9 @@ final class BackupPreferences: ObservableObject {
         static let keepAliveEnabled = "backup.keepAlive.enabled"
         static let keepAliveMode = "backup.keepAlive.mode"
         static let albumsFromLibrary = "backup.albumsFromLibrary"
+        static let onlyWhileCharging = "backup.onlyWhileCharging"
+        static let minimumBatteryPercent = "backup.minimumBatteryPercent"
+        static let significantLocationWake = "backup.significantLocationWake"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -51,6 +54,15 @@ final class BackupPreferences: ObservableObject {
     @Published var keepAliveEnabled: Bool { didSet { defaults.set(keepAliveEnabled, forKey: Key.keepAliveEnabled) } }
     @Published var keepAliveMode: KeepAliveMode { didSet { defaults.set(keepAliveMode.rawValue, forKey: Key.keepAliveMode) } }
     @Published var albumsFromLibrary: Bool { didSet { defaults.set(albumsFromLibrary, forKey: Key.albumsFromLibrary) } }
+    /// Require external power for automatic/background backups and set
+    /// `requiresExternalPower` on background processing requests (issue #14).
+    @Published var onlyWhileCharging: Bool { didSet { defaults.set(onlyWhileCharging, forKey: Key.onlyWhileCharging) } }
+    /// Pause automatic/background backups while unplugged below this percentage.
+    /// `0` disables the threshold.
+    @Published var minimumBatteryPercent: Int { didSet { defaults.set(minimumBatteryPercent, forKey: Key.minimumBatteryPercent) } }
+    /// Opt-in significant-location-change wake (arrival home / travel) for
+    /// unattended photo discovery; requires Always location permission.
+    @Published var significantLocationWake: Bool { didSet { defaults.set(significantLocationWake, forKey: Key.significantLocationWake) } }
 
     private let defaults: UserDefaults
 
@@ -78,6 +90,9 @@ final class BackupPreferences: ObservableObject {
         // Off until asked for: it creates albums in the user's Google account,
         // which an update should not start doing on its own.
         albumsFromLibrary = defaults.bool(forKey: Key.albumsFromLibrary)
+        onlyWhileCharging = defaults.bool(forKey: Key.onlyWhileCharging)
+        minimumBatteryPercent = max(0, min(100, defaults.integer(forKey: Key.minimumBatteryPercent)))
+        significantLocationWake = defaults.bool(forKey: Key.significantLocationWake)
     }
 
     func toggle(albumID: String) {
@@ -241,17 +256,21 @@ final class PhotoAlbumStore: ObservableObject {
         return sources
     }
 
-    /// Synchronous variant, retained for the background-window scan where the
-    /// work already runs outside a frame deadline.
-    func sourcesSynchronously(for albumIDs: Set<String>) -> [MediaSource] {
+    /// Snapshot of selected albums suitable for off-main-actor PhotoKit scans.
+    func scanTargets(for albumIDs: Set<String>) -> [(id: String, collection: PHAssetCollection?)] {
+        albums.filter { albumIDs.contains($0.id) }.map { ($0.id, $0.collection) }
+    }
+
+    /// Enumerate every selected album off the main actor.
+    nonisolated static func sources(for targets: [(id: String, collection: PHAssetCollection?)]) -> [MediaSource] {
         var seen = Set<String>()
         var sources: [MediaSource] = []
-        for album in albums where albumIDs.contains(album.id) {
+        for (_, collection) in targets {
             let assets: PHFetchResult<PHAsset>
-            if let collection = album.collection {
+            if let collection {
                 assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
             } else {
-                assets = PHAsset.fetchAssets(with: Self.allPhotosOptions())
+                assets = PHAsset.fetchAssets(with: allPhotosOptions())
             }
             assets.enumerateObjects { asset, _, _ in
                 guard seen.insert(asset.localIdentifier).inserted else { return }
@@ -259,6 +278,41 @@ final class PhotoAlbumStore: ObservableObject {
             }
         }
         return sources
+    }
+
+    /// Restrict a PhotoKit persistent-change batch to the selected albums off
+    /// the main actor.
+    nonisolated static func sources(
+        for targets: [(id: String, collection: PHAssetCollection?)],
+        selectedAlbumIDs: Set<String>,
+        matching identifiers: Set<String>
+    ) -> [MediaSource] {
+        guard !identifiers.isEmpty else { return [] }
+        if selectedAlbumIDs.contains(PhotoAlbum.allPhotosID) {
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: .includingBurstFrames)
+            var result: [MediaSource] = []
+            assets.enumerateObjects { asset, _, _ in
+                guard asset.mediaType == .image || asset.mediaType == .video else { return }
+                result.append(.asset(localIdentifier: asset.localIdentifier))
+            }
+            return result
+        }
+
+        var matched = Set<String>()
+        for (_, collection) in targets {
+            guard let collection else { continue }
+            let assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
+            assets.enumerateObjects { asset, _, stop in
+                if identifiers.contains(asset.localIdentifier) { matched.insert(asset.localIdentifier) }
+                if matched.count == identifiers.count { stop.pointee = true }
+            }
+        }
+        return matched.map { .asset(localIdentifier: $0) }
+    }
+
+    /// Synchronous variant, retained for callers already on a background thread.
+    func sourcesSynchronously(for albumIDs: Set<String>) -> [MediaSource] {
+        Self.sources(for: scanTargets(for: albumIDs))
     }
 
     /// Recompute "N of M backed up" for the selected albums. `isBackedUp` is

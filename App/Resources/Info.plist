@@ -5,6 +5,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.g8row.photosbackup.background-backup</string>
+		<string>com.g8row.photosbackup.background-refresh</string>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).continued-backup.*</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
@@ -27,6 +28,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Only used if you enable Location keep-alive or Wake on Location Change in Settings → Background. The location itself is ignored; receiving coarse updates lets iOS keep backups running or wake the app to discover new photos.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Only used if you choose Location for Keep Running in Background. The location itself is ignored; receiving it is what lets iOS keep the backup running while the app is closed.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
@@ -39,6 +42,7 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>fetch</string>
 		<string>location</string>
 		<string>processing</string>
 	</array>
