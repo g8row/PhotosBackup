@@ -21,7 +21,10 @@ without a desktop companion or hosted service.
 - Capture the single-use `oauth_token` in-process from the web view's cookie store.
 - Exchange the token for a Google Photos credential entirely on the device.
 - Select albums from the local Photos library.
-- Queue individual photos, videos, or all items in selected albums.
+- Queue individual photos, videos, all items in selected albums, or folders from
+  Files and iCloud Drive.
+- Optionally file uploads into matching Google Photos albums named after their
+  iOS albums or picked folders (**Settings → Backup → Add to Matching Albums**).
 - Show hashing, duplicate-check, upload, and finalization progress per item.
 - Avoid re-uploading media already present in Google Photos.
 - Retry transient failures, cancel work, and resume after reconnecting.
@@ -34,6 +37,8 @@ without a desktop companion or hosted service.
   Photos, under the current Storage Saver and storage quota settings.
 - Back up an edited photo as it looks on the iPhone, the file the Google Photos
   app would upload itself, so Google Photos' Free up space recognises it.
+- Back up every frame of a burst, including frames Photos hides inside the
+  burst, so the Google Photos app counts bursts as backed up.
 - Back up an edited video's original as well as its edit, including Cinematic
   videos, which the camera saves as edited, so the Google Photos app counts them.
 - With Back Up Live Photo Motion on, as it is by default, back up a Live Photo with its motion
@@ -83,9 +88,9 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.3.8** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-Every push and pull request runs the suite on an iPhone simulator: 208 tests,
-206 pass, 0 fail. The 2 opt-in live tests are skipped.
+Latest release: **0.4.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+Every push and pull request runs the suite on an iPhone simulator: 227 tests,
+225 pass, 0 fail. The 2 opt-in live tests are skipped.
 
 Each release's `.ipa` is built by GitHub Actions from the tagged commit and
 attached with its SHA-256, so the binary can be checked against the source it
