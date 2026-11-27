@@ -19,6 +19,7 @@ final class PhotosStack {
                                  checkpointCleaner: uploader.checkpointCleaner(),
                                  preparationMarkers: UserDefaultsPreparationMarkers())
         self.queue.onCredentialRejected = { [weak account] error in account?.report(error) }
+        self.queue.hasCompletedBackgroundTransfer = { BackgroundFileUploadTransport.shared.hasStoredResult(for: $0) }
     }
 
     /// Restore the saved account and then sweep only staging files that no

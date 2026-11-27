@@ -35,6 +35,7 @@ final class BackupPreferences: ObservableObject {
         static let backUpLivePhotoMotion = "backup.livePhotoMotion"
         static let keepAliveEnabled = "backup.keepAlive.enabled"
         static let keepAliveMode = "backup.keepAlive.mode"
+        static let albumsFromLibrary = "backup.albumsFromLibrary"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -49,6 +50,7 @@ final class BackupPreferences: ObservableObject {
     /// `BackgroundKeepAlive`.
     @Published var keepAliveEnabled: Bool { didSet { defaults.set(keepAliveEnabled, forKey: Key.keepAliveEnabled) } }
     @Published var keepAliveMode: KeepAliveMode { didSet { defaults.set(keepAliveMode.rawValue, forKey: Key.keepAliveMode) } }
+    @Published var albumsFromLibrary: Bool { didSet { defaults.set(albumsFromLibrary, forKey: Key.albumsFromLibrary) } }
 
     private let defaults: UserDefaults
 
@@ -73,6 +75,9 @@ final class BackupPreferences: ObservableObject {
         // audio needs no permission, and it stops once the queue cannot move.
         keepAliveEnabled = defaults.object(forKey: Key.keepAliveEnabled) as? Bool ?? true
         keepAliveMode = KeepAliveMode(rawValue: defaults.string(forKey: Key.keepAliveMode) ?? "") ?? .audio
+        // Off until asked for: it creates albums in the user's Google account,
+        // which an update should not start doing on its own.
+        albumsFromLibrary = defaults.bool(forKey: Key.albumsFromLibrary)
     }
 
     func toggle(albumID: String) {

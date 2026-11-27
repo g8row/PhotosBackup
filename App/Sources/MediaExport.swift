@@ -33,6 +33,11 @@ enum MediaSource: Equatable, Sendable {
     /// account, the Google Photos app did not count Cinematic videos as backed
     /// up; it did once the originals were added (seen on device on 2026-10-31).
     case videoOriginal(localIdentifier: String)
+    /// A photo or video inside a folder picked from the Files app, outside
+    /// the photo library: the folder's `PickedFolderStore` id and the file's
+    /// path inside it. Copied into staging at export time, while the folder's
+    /// security-scoped access is held.
+    case folderFile(folderID: String, relativePath: String)
 }
 
 extension PHFetchOptions {
@@ -98,6 +103,12 @@ actor MediaExporter {
     }
 
     static let directoryName = "gpmc-uploads"
+
+    private let folders: PickedFolderStore
+
+    init(folders: PickedFolderStore = .shared) {
+        self.folders = folders
+    }
 
     static var root: URL {
         // Background URLSession upload bodies must not live in Caches: iOS may
@@ -174,6 +185,57 @@ actor MediaExporter {
             return try await exportEditBase(identifier, allowsNetworkAccess: allowsNetworkAccess)
         case .videoOriginal(let identifier):
             return try await exportVideoOriginal(identifier, allowsNetworkAccess: allowsNetworkAccess)
+        case .folderFile(let folderID, let relativePath):
+            // Detached: the coordinated read blocks, for as long as an iCloud
+            // Drive download takes, and must not hold up this actor.
+            let folders = self.folders
+            let staged = try await Task.detached {
+                try Self.copyFolderFile(folderID: folderID, relativePath: relativePath,
+                                        folders: folders, allowsNetworkAccess: allowsNetworkAccess)
+            }.value
+            do {
+                return try describe(staged.url, filename: staged.url.lastPathComponent,
+                                    modified: staged.modified, temporary: true)
+            } catch {
+                try? FileManager.default.removeItem(at: staged.url.deletingLastPathComponent())
+                throw error
+            }
+        }
+    }
+
+    /// Copy one file out of a picked folder into staging. The staged copy is
+    /// what gets hashed and uploaded, so the background transfer and any
+    /// retry after a relaunch never need the folder's access again.
+    private static func copyFolderFile(folderID: String, relativePath: String, folders: PickedFolderStore,
+                                       allowsNetworkAccess: Bool) throws -> (url: URL, modified: Date?) {
+        try folders.withAccess(to: folderID) { folderURL in
+            let file = folderURL.appendingPathComponent(relativePath)
+            let values = try? file.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey,
+                                                            .contentModificationDateKey])
+            // Same rule as the library: a background window does not download.
+            if !allowsNetworkAccess, values?.ubiquitousItemDownloadingStatus == .notDownloaded {
+                throw Failure.iCloudDownloadRequired
+            }
+            let destination = try stage(named: file.lastPathComponent)
+            // A coordinated read is what makes iCloud Drive and other file
+            // providers fetch a file that is not on the device yet.
+            var coordinationError: NSError?
+            var copyError: Error?
+            NSFileCoordinator().coordinate(readingItemAt: file, options: .withoutChanges, error: &coordinationError) { readable in
+                do { try FileManager.default.copyItem(at: readable, to: destination) }
+                catch { copyError = error }
+            }
+            if let error = coordinationError ?? copyError {
+                try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+                let nsError = error as NSError
+                if nsError.domain == NSCocoaErrorDomain,
+                   nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError {
+                    // Gone from the folder, like a photo deleted from the library.
+                    throw Failure.missingAsset
+                }
+                throw Failure.unreadable(error.localizedDescription)
+            }
+            return (destination, values?.contentModificationDate)
         }
     }
 

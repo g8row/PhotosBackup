@@ -44,6 +44,13 @@ private extension NSLock {
     func sync<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }
 
+/// What each worker call was told about the duplicate check, in call order.
+final class SkipRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Bool] = []
+    var calls: [Bool] { lock.sync { recorded } }
+    func record(_ skipsDuplicateCheck: Bool) { lock.sync { recorded.append(skipsDuplicateCheck) } }
+}
 
 /// A queue sleeper that records each requested delay and holds every sleeper
 /// until the test opens it.
@@ -846,6 +853,38 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", editMark: "t1790000000000"))
     }
 
+    /// Re-upload queues a backed-up asset again and has its row skip the
+    /// duplicate check; an ordinary row still runs it.
+    func testReuploadQueuesABackedUpAssetThatSkipsTheDuplicateCheck() async {
+        let skipped = SkipRecorder()
+        let worker: UploadWorker = { _, _, _, options, _ in
+            skipped.record(options.skipsDuplicateCheck)
+            return .alreadyBackedUp(mediaKey: "KEY")
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
+
+        XCTAssertEqual(queue.reupload([.asset(localIdentifier: "asset-1")]), 1)
+        await settle(queue) { queue.items.count == 1 && queue.items.first?.state == .alreadyBackedUp }
+        XCTAssertEqual(skipped.calls, [false, true])
+    }
+
+    /// A re-upload row that outlives the process still skips the check.
+    func testAReuploadRowRestoresAsOne() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("person@gmail.com")
+        first.reupload([.asset(localIdentifier: "asset-1")])
+        XCTAssertEqual(persistence.snapshot?.items.first?.forceUpload, true)
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        XCTAssertEqual(restored.items.first?.forcesUpload, true)
+    }
+
     func testAMotionCheckpointKeepsItsStillHash() throws {
         let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.MOV", filename: "IMG.MOV",
                                           modified: Date(timeIntervalSince1970: 100), byteCount: 123,
@@ -1506,6 +1545,58 @@ final class UploadQueueTests: XCTestCase {
         await settle(queue) { queue.items[1].state.isWorking }
         assertAggregatesMatchRows(queue)
     }
+
+    /// A background-URLSession relaunch only attaches to rows whose PUT has
+    /// already finished (a stored result on disk or a checkpointed receipt),
+    /// leaving unrelated in-flight uploads undisturbed so the relaunch handler
+    /// returns promptly instead of spinning for 25 s.
+    func testBackgroundTransferDrainSkipsInFlightUploadsWithoutStoredResult() async {
+        let finishedID = UUID()
+        let stillUploadingID = UUID()
+        let prepared = PreparedUpload(uploadURL: URL(string: "https://example.test/upload")!,
+                                      hash: Data(repeating: 1, count: 20), filename: "IMG.JPG",
+                                      modified: Date(timeIntervalSince1970: 100), byteCount: 100, receipt: nil)
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                          modified: Date(timeIntervalSince1970: 100), byteCount: 100,
+                                          temporary: true, prepared: prepared, continuesAfterProcessExit: true)
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version,
+            accountIdentifier: "person@gmail.com",
+            items: [
+                PersistedUploadItem(id: stillUploadingID, source: .asset("in-flight"), name: "BIG.MOV",
+                                    byteCount: 100, attempts: 1, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint),
+                PersistedUploadItem(id: finishedID, source: .asset("done-put"), name: "IMG.JPG",
+                                    byteCount: 100, attempts: 1, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint),
+            ],
+            completedSourceKeys: []
+        ))
+        let started = StartedIDs()
+        let worker: UploadWorker = { id, _, _, _, _ in
+            started.record(id)
+            return .uploaded(mediaKey: "KEY-\(id.uuidString)")
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 2, persistence: persistence)
+        queue.hasCompletedBackgroundTransfer = { $0 == finishedID }
+        queue.noteBackgroundTransferCompletionsPending()
+        queue.setNetworkAccess(allowed: false, pauseReason: "Restoring")
+        queue.activateAccount("person@gmail.com")
+        queue.setNetworkAccess(allowed: true)
+        queue.resumeBackgroundTransferCompletions()
+
+        await queue.waitUntilBackgroundTransfersHandled()
+        XCTAssertEqual(started.ids, [finishedID])
+        XCTAssertEqual(queue.items.first { $0.id == finishedID }?.state, .done)
+        XCTAssertEqual(queue.items.first { $0.id == stillUploadingID }?.state, .queued)
+    }
+}
+
+private final class StartedIDs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [UUID] = []
+    var ids: [UUID] { lock.sync { recorded } }
+    func record(_ id: UUID) { lock.sync { recorded.append(id) } }
 }
 
 final class ActivityListingTests: XCTestCase {

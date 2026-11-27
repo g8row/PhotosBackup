@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var connectionCheckResult: PhotosAccount.VerificationOutcome?
     @State private var verifyMessage: String?
     @State private var isVerifying = false
+    @State private var confirmReupload = false
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
 
     var body: some View {
@@ -134,10 +135,11 @@ struct SettingsView: View {
             Toggle("Storage Saver", isOn: $preferences.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
             Toggle("Back Up Live Photo Motion", isOn: $preferences.backUpLivePhotoMotion)
+            Toggle("Add to Matching Albums", isOn: $preferences.albumsFromLibrary)
         } header: {
             Text("Backup")
         } footer: {
-            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality.\n\nBack Up Live Photo Motion attaches each Live Photo's motion to its photo, so it plays as a Live Photo in Google Photos and the Google Photos app's Free up space can remove it from this iPhone. It uploads the short video too, a few MB per Live Photo, and uses storage the same way the photo does. Live Photos backed up earlier get their motion added in the background.")
+            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality.\n\nBack Up Live Photo Motion attaches each Live Photo's motion to its photo, so it plays as a Live Photo in Google Photos and the Google Photos app's Free up space can remove it from this iPhone. It uploads the short video too, a few MB per Live Photo, and uses storage the same way the photo does. Live Photos backed up earlier get their motion added in the background.\n\nAdd to Matching Albums puts each new upload into a Google Photos album with the same name as each of your albums holding it, or for a file from a picked folder, the folder holding it, creating the album the first time. Photos backed up before it was turned on are not moved.")
         }
     }
 
@@ -153,6 +155,15 @@ struct SettingsView: View {
                 }
             }
             .disabled(!canVerify)
+            Button("Re-upload Selected Albums") { confirmReupload = true }
+                .disabled(!canVerify)
+                .confirmationDialog("Upload the selected albums again?", isPresented: $confirmReupload,
+                                    titleVisibility: .visible) {
+                    Button("Re-upload") { runReupload() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Every photo and video in the selected albums is uploaded again, including ones already in Google Photos. This takes as long and uses as much data as the first backup.")
+                }
             if let verifyMessage {
                 Text(verifyMessage)
                     .font(.footnote)
@@ -162,7 +173,7 @@ struct SettingsView: View {
         } header: {
             Text("Re-check")
         } footer: {
-            Text("Compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
+            Text("Re-check compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.\n\nRe-upload sends every item again using your current Storage Saver and storage quota settings. Google Photos may keep the copy it already has.")
         }
     }
 
@@ -205,6 +216,17 @@ struct SettingsView: View {
         verifyMessage = nil
         Task {
             let outcome = await automaticBackup.reverifySelectedAlbums()
+            isVerifying = false
+            verifyMessage = DashboardView.message(for: outcome)
+        }
+    }
+
+    private func runReupload() {
+        guard canVerify else { return }
+        isVerifying = true
+        verifyMessage = nil
+        Task {
+            let outcome = await automaticBackup.reuploadSelectedAlbums()
             isVerifying = false
             verifyMessage = DashboardView.message(for: outcome)
         }

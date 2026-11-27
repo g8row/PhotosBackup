@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct DashboardView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -11,6 +12,8 @@ struct DashboardView: View {
     let onConnect: () -> Void
     let onAccount: () -> Void
     @State private var showPicker = false
+    @State private var showFolderPicker = false
+    @State private var isScanningFolder = false
     @State private var showingStopBackupConfirmation = false
     @State private var manualRunMessage: String?
     @State private var isStartingManualRun = false
@@ -50,6 +53,9 @@ struct DashboardView: View {
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
             }
+            .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+                importFolder(result)
+            }
             .confirmationDialog(
                 "Stop all backups?",
                 isPresented: $showingStopBackupConfirmation,
@@ -78,6 +84,7 @@ struct DashboardView: View {
     private func enqueue(_ sources: [MediaSource]) {
         guard !sources.isEmpty else { return }
         queue.reverify(sources)
+        automaticBackup.refreshBackgroundContinuation()
     }
 
     @ViewBuilder private var accountBanner: some View {
@@ -180,11 +187,14 @@ struct DashboardView: View {
 
     @ViewBuilder private var quickActions: some View {
         if dynamicTypeSize.isAccessibilitySize {
-            VStack(spacing: 12) { albumBackupAction; photoPickerAction }
+            VStack(spacing: 12) { albumBackupAction; photoPickerAction; folderPickerAction }
                 .buttonStyle(CardButtonStyle())
         } else {
-            HStack(spacing: 12) { albumBackupAction; photoPickerAction }
-                .buttonStyle(CardButtonStyle())
+            VStack(spacing: 12) {
+                HStack(spacing: 12) { albumBackupAction; photoPickerAction }
+                folderPickerAction
+            }
+            .buttonStyle(CardButtonStyle())
         }
     }
 
@@ -223,6 +233,52 @@ struct DashboardView: View {
             quickActionLabel(symbol: "photo.badge.plus", title: "Pick Photos", detail: "Manual backup", isEnabled: enabled)
         }
         .disabled(!enabled)
+    }
+
+    private var folderPickerAction: some View {
+        let enabled = account.status.isUsable && !isScanningFolder
+        return Button { showFolderPicker = true } label: {
+            quickActionLabel(symbol: "folder.badge.plus",
+                             title: isScanningFolder ? "Scanning…" : "Pick Folder",
+                             detail: "From Files or iCloud Drive", isEnabled: enabled)
+        }
+        .disabled(!enabled)
+    }
+
+    /// Queue every photo and video under a folder from the Files app. The
+    /// scan walks the whole tree, so it runs off the main actor. Items already
+    /// backed up from the same folder are skipped, the way an album rescan
+    /// skips them.
+    private func importFolder(_ result: Result<URL, Error>) {
+        guard case .success(let folderURL) = result else {
+            if case .failure(let error) = result {
+                manualRunMessage = "Could not open that folder: \(error.localizedDescription)"
+            }
+            return
+        }
+        isScanningFolder = true
+        manualRunMessage = nil
+        Task {
+            defer { isScanningFolder = false }
+            do {
+                let sources = try await Task.detached(priority: .userInitiated) {
+                    try FolderScanner.sources(inPickedFolder: folderURL)
+                }.value
+                let queued = queue.enqueue(sources, skippingExisting: true).count
+                if queued > 0 { automaticBackup.refreshBackgroundContinuation() }
+                // Counts only: folder and file names stay out of the log.
+                DiagnosticEventLog.shared.record(
+                    "queue", "Scanned a picked folder: \(sources.count) photos and videos, \(queued) newly queued")
+                let name = folderURL.lastPathComponent
+                manualRunMessage = sources.isEmpty
+                    ? "No photos or videos found in “\(name)”."
+                    : queued == 0
+                        ? "Everything in “\(name)” is already backed up or queued."
+                        : "Backing up \(queued.formatted()) items from “\(name)”. Watch progress in Activity."
+            } catch {
+                manualRunMessage = "Could not read that folder: \(error.localizedDescription)"
+            }
+        }
     }
 
     private var folderSummary: some View {
@@ -401,6 +457,7 @@ struct DashboardView: View {
         case .nothingToDo: return "Everything in your selected albums is already backed up."
         case .started(let count): return "Backing up \(count.formatted()) items. Watch progress in Activity."
         case .rechecking(let count): return "Re-checking \(count.formatted()) items against Google Photos."
+        case .reuploading(let count): return "Uploading \(count.formatted()) items again. Watch progress in Activity."
         }
     }
 

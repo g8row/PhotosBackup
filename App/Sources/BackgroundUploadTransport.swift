@@ -31,6 +31,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     /// Last time each live transfer reported bytes on the wire, so a wedged
     /// task can be failed instead of sitting on "Uploading" forever.
     private var lastProgressAt: [UUID: Date] = [:]
+    private var lastByteCount: [UUID: Int64] = [:]
     private var watchdog: Timer?
     private var eventsFinished = false
     private var eventsDrainer: (@Sendable () async -> Void)?
@@ -107,9 +108,14 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         discardAndCancel(transferID: transferID)
     }
 
-    private func noteProgress(for transferID: UUID) {
+    func hasStoredResult(for transferID: UUID) -> Bool {
+        FileManager.default.fileExists(atPath: resultURL(for: transferID).path)
+    }
+
+    private func noteProgress(for transferID: UUID, bytesSent: Int64? = nil) {
         lock.lock()
         lastProgressAt[transferID] = Date()
+        if let bytesSent { lastByteCount[transferID] = max(lastByteCount[transferID] ?? 0, bytesSent) }
         lock.unlock()
     }
 
@@ -136,30 +142,84 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         }
     }
 
+    /// Reconcile seemingly quiet transfers against the real background URL
+    /// session before failing them. While the app is suspended, `nsurlsessiond`
+    /// keeps moving bytes without waking the app for progress callbacks, so
+    /// wall-clock silence alone cannot tell a live transfer from a wedged one.
     private func failStalledTransfers() {
         let cutoff = Date().addingTimeInterval(-Self.stallTimeout)
         lock.lock()
-        let stalled = lastProgressAt.filter { $0.value < cutoff }.map(\.key)
-        for id in stalled { lastProgressAt[id] = nil }
+        let candidates: [(id: UUID, lastBytes: Int64)] = lastProgressAt.compactMap { id, date in
+            guard date < cutoff else { return nil }
+            return (id, lastByteCount[id] ?? 0)
+        }
         lock.unlock()
-        for id in stalled {
-            // Retryable on purpose: the queue backs off and tries again, and if
-            // the real cause is a dead network its own policy pause holds it.
-            resolve(id, with: StoredResult(
-                url: nil, statusCode: nil, headers: [:], body: Data(),
-                errorCode: URLError.timedOut.rawValue,
-                errorDescription: "the upload stopped making progress"
-            ))
-            cancelTask(transferID: id)
+        guard !candidates.isEmpty else {
+            stopWatchdogIfIdle()
+            return
         }
-        if !stalled.isEmpty {
-            DiagnosticEventLog.shared.record(
-                "transport",
-                "Cancelled \(stalled.count) transfer(s) after 900 seconds without progress",
-                level: .warning
-            )
+        session.getAllTasks { [weak self] tasks in
+            guard let self else { return }
+            var tasksByID: [UUID: URLSessionTask] = [:]
+            for task in tasks {
+                if let desc = task.taskDescription, let id = UUID(uuidString: desc) {
+                    tasksByID[id] = task
+                }
+            }
+            var stalledCount = 0
+            for candidate in candidates {
+                let id = candidate.id
+                // A transfer that finished while the app was suspended already
+                // has its stored response on disk — deliver it instead of
+                // throwing it away.
+                if let stored = self.loadResult(for: id) {
+                    self.resolve(id, with: stored)
+                    continue
+                }
+                if let task = tasksByID[id] {
+                    if task.state == .completed {
+                        // Delegate completion is already on its way.
+                        self.noteProgress(for: id, bytesSent: task.countOfBytesSent)
+                        continue
+                    }
+                    if task.countOfBytesSent > candidate.lastBytes {
+                        // Bytes moved while the app was suspended.
+                        self.noteProgress(for: id, bytesSent: task.countOfBytesSent)
+                        continue
+                    }
+                    if task.state == .suspended {
+                        self.noteProgress(for: id, bytesSent: task.countOfBytesSent)
+                        task.resume()
+                        continue
+                    }
+                }
+                self.lock.lock()
+                let stillTracked = self.lastProgressAt[id] != nil
+                if stillTracked {
+                    self.lastProgressAt[id] = nil
+                    self.lastByteCount[id] = nil
+                }
+                self.lock.unlock()
+                guard stillTracked else { continue }
+                stalledCount += 1
+                // Retryable on purpose: the queue backs off and tries again, and if
+                // the real cause is a dead network its own policy pause holds it.
+                self.resolve(id, with: StoredResult(
+                    url: nil, statusCode: nil, headers: [:], body: Data(),
+                    errorCode: URLError.timedOut.rawValue,
+                    errorDescription: "the upload stopped making progress"
+                ))
+                tasksByID[id]?.cancel()
+            }
+            if stalledCount > 0 {
+                DiagnosticEventLog.shared.record(
+                    "transport",
+                    "Cancelled \(stalledCount) transfer(s) after 900 seconds without progress",
+                    level: .warning
+                )
+            }
+            self.stopWatchdogIfIdle()
         }
-        stopWatchdogIfIdle()
     }
 
     func forget(transferID: UUID) async {
@@ -249,6 +309,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         progressHandlers[transferID] = nil
         starting.remove(transferID)
         lastProgressAt[transferID] = nil
+        lastByteCount[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
     }
@@ -357,6 +418,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         let continuations = waiters.removeValue(forKey: transferID) ?? []
         progressHandlers[transferID] = nil
         lastProgressAt[transferID] = nil
+        lastByteCount[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
         // Checked continuations are not resumed automatically when their Swift
@@ -390,6 +452,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         progressHandlers[transferID] = nil
         starting.remove(transferID)
         lastProgressAt[transferID] = nil
+        lastByteCount[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
         guard !continuations.isEmpty else { return }
@@ -474,7 +537,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
                     didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
                     totalBytesExpectedToSend: Int64) {
         guard let value = task.taskDescription, let transferID = UUID(uuidString: value) else { return }
-        noteProgress(for: transferID)
+        noteProgress(for: transferID, bytesSent: totalBytesSent)
         lock.lock()
         let reporter = progressHandlers[transferID]
         lock.unlock()

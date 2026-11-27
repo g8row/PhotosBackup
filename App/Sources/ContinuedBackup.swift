@@ -16,6 +16,11 @@ enum ContinuedBackupPolicy {
     /// app stops counting on it.
     static let launchTimeout: TimeInterval = 15
 
+    /// How long a transient network pause may last before ending the Live
+    /// Activity, so a brief Wi-Fi blip does not kill the continuation for the
+    /// rest of the background run.
+    static let pauseGrace: TimeInterval = 30
+
     /// Whether the queue can move on its own. A rate-limit wait ends by itself,
     /// so it keeps the task; a pause that needs the user, a connection, the
     /// account or a new iOS window does not.

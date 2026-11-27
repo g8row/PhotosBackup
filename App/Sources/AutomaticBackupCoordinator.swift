@@ -76,6 +76,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private var isForeground = true
     private var shouldRunAfterActivation = false
     private var backgroundOperation: Task<Void, Never>?
+    private var backgroundRunID: UUID?
     private var foregroundOperation: Task<Void, Never>?
     private var foregroundRunID: UUID?
     /// The scheduling outcome last written to the event log. `updateSchedule`
@@ -90,6 +91,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// A refused or expired request is not retried for a minute, so a queue
     /// that changes every second does not resubmit every second.
     private var continuedRetryAfter: Date?
+    /// When the queue last paused transiently while a continued backup ran.
+    private var continuedUnwantedSince: Date?
+    private var continuedGraceCheck: Task<Void, Never>?
     /// The run-history record of the time spent in the background under it.
     private var continuedRun: (id: UUID, settledBefore: Int)?
     /// The opt-in SideStore-style keep-alive: silent audio or coarse location
@@ -133,6 +137,12 @@ final class AutomaticBackupCoordinator: ObservableObject {
         if #available(iOS 26.0, *) { setUpContinuedBackup() }
         #endif
         keepAlive.onLost = { [weak self] reason in self?.keepAliveLost(reason) }
+        keepAlive.onSuspended = { [weak self] reason in self?.keepAliveSuspended(reason) }
+        keepAlive.onResumed = { [weak self] in self?.keepAliveResumed() }
+        keepAlive.onLocationAuthorized = { [weak self] in
+            self?.keepAliveRetryAfter = nil
+            self?.refreshKeepAlive()
+        }
         keepAliveObservation = queue.objectWillChange
             .throttle(for: .seconds(1), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] _ in
@@ -624,6 +634,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         case nothingToDo
         case started(count: Int)
         case rechecking(count: Int)
+        case reuploading(count: Int)
     }
 
     /// "Back Up Now". Queues the entire selection, so the count reported back is
@@ -665,6 +676,23 @@ final class AutomaticBackupCoordinator: ObservableObject {
         return .rechecking(count: total)
     }
 
+    /// "Re-upload Selected Albums". Uploads the selection again even where
+    /// Google already holds the files, so existing backups are committed under
+    /// the storage settings in force now.
+    func reuploadSelectedAlbums() async -> ManualRunOutcome {
+        guard !preferences.selectedAlbumIDs.isEmpty else { return noteManual(.reupload, .noAlbumsSelected) }
+        await albums.refresh()
+        guard albums.canRead else { return noteManual(.reupload, .noLibraryAccess) }
+        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        guard !sources.isEmpty else { return noteManual(.reupload, .nothingToDo) }
+        // Same reason as Re-check: a failed row would otherwise block its source.
+        queue.retryRetryableFailures()
+        let total = queue.reupload(sources)
+        guard total > 0 else { return noteManual(.reupload, .nothingToDo) }
+        startForegroundRun(sources, source: .reupload)
+        return .reuploading(count: total)
+    }
+
     /// Log a manual run that did not start, with the reason the user was shown.
     private func noteManual(_ source: AutomaticBackupRunSource, _ outcome: ManualRunOutcome) -> ManualRunOutcome {
         let reason: String
@@ -672,7 +700,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         case .noAlbumsSelected: reason = "no albums are selected"
         case .noLibraryAccess: reason = "the photo library cannot be read (\(DiagnosticReportBuilder.photoAuthorization()))"
         case .nothingToDo: reason = "everything selected is already backed up or queued"
-        case .started, .rechecking: return outcome
+        case .started, .rechecking, .reuploading: return outcome
         }
         DiagnosticEventLog.shared.record(
             "run",
@@ -682,11 +710,21 @@ final class AutomaticBackupCoordinator: ObservableObject {
         return outcome
     }
 
+    /// Start background continuation (keep-alive + iOS 26 continued task) right
+    /// away when the user starts a backup, without waiting for the 1 s queue
+    /// throttle, so locking the phone immediately does not miss the foreground
+    /// start window.
+    func refreshBackgroundContinuation() {
+        refreshContinuedBackup()
+        refreshKeepAlive()
+    }
+
     /// Take over the foreground loop for a manually started run, so the queue
     /// keeps draining without the user tapping again.
     private func startForegroundRun(_ sources: [MediaSource], source: AutomaticBackupRunSource) {
         cancelForegroundScan()
         ranForegroundBackup = true
+        refreshBackgroundContinuation()
         let runID = UUID()
         foregroundRunID = runID
         let completedBefore = queue.completedSourceCount
@@ -728,11 +766,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
         if !continuesInBackground { queue.setICloudDownloadsAllowed(false) }
         queue.resumeSystemWork()
         backgroundOperation?.cancel()
+        let runID = UUID()
+        backgroundRunID = runID
         let completion = BackgroundTaskCompletion()
 
         let operation = Task { @MainActor [weak self, weak task] in
             guard let self else {
-                task?.setTaskCompleted(success: false)
+                if completion.claim() { task?.setTaskCompleted(success: false) }
                 return
             }
             let report = await self.performBackgroundBackup()
@@ -743,7 +783,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
             if !keepsRunning { AppSessionTracker.note(.background) }
             // iOS may suspend the process as soon as the task completes.
             DiagnosticEventLog.shared.flush()
-            self.backgroundOperation = nil
+            if self.backgroundRunID == runID {
+                self.backgroundOperation = nil
+                self.backgroundRunID = nil
+            }
             // After an expiry the fallback below may already have told iOS.
             guard completion.claim() else { return }
             task?.expirationHandler = nil
@@ -761,16 +804,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
             )
             DiagnosticEventLog.shared.flush()
             operation.cancel()
-            Task { @MainActor [weak self, weak task] in
-                // The queue keeps going when a continued backup holds the app.
-                guard let self, !self.continuesInBackground else { return }
-                // Hand the window back before the cancelled run unwinds: ten
-                // exports in flight can outlast the time iOS allows, and iOS
-                // then suspends the app with this window still open.
-                self.queue.suspendForBackgroundExpiration()
-                AppSessionTracker.note(.background)
-                DiagnosticEventLog.shared.flush()
-                try? await Task.sleep(nanoseconds: Self.expirationGrace)
+            // Schedule the safety completion off the main actor and regardless
+            // of `continuesInBackground`: if the main actor is busy in a full
+            // library scan or snapshot write, iOS still gets the window back
+            // before suspending the process with the task still open.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + .nanoseconds(Int(Self.expirationGrace))
+            ) { [weak task] in
                 guard completion.claim() else { return }
                 DiagnosticEventLog.shared.record(
                     "scheduler",
@@ -778,7 +818,17 @@ final class AutomaticBackupCoordinator: ObservableObject {
                     level: .warning
                 )
                 DiagnosticEventLog.shared.flush()
+                task?.expirationHandler = nil
                 task?.setTaskCompleted(success: false)
+            }
+            Task { @MainActor [weak self] in
+                // The queue keeps going when a continued backup holds the app.
+                guard let self, !self.continuesInBackground else { return }
+                // Pause the queue and disarm the preparation guard before the
+                // cancelled run unwinds.
+                self.queue.suspendForBackgroundExpiration()
+                AppSessionTracker.note(.background)
+                DiagnosticEventLog.shared.flush()
             }
         }
         task.expirationHandler = expire
@@ -854,7 +904,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
                                          requiresAutomaticBackup: Bool = true,
                                          waitsForUploads: Bool = true) async -> BackgroundRunReport {
         await photos.start()
+        if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         _ = await network.waitForInitialStatus()
+        if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         applyNetworkPolicy()
 
         // A user pause is durable and must not be bypassed by a scheduled run.
@@ -872,6 +924,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
 
         await albums.refresh()
+        if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         guard albums.canRead else {
             return finish(.init(success: false,
                                 summary: "No photo library access (\(DiagnosticReportBuilder.photoAuthorization()))"))
@@ -1150,7 +1203,35 @@ extension AutomaticBackupCoordinator {
             return
         }
         if session.isActive {
-            guard queueCanMoveOnItsOwn else { return endContinuedBackup(session) }
+            if !queueCanMoveOnItsOwn {
+                let transientNetworkPause = !queue.isIdle && queue.hasWorkableItems
+                    && !queue.isUserPaused && queue.haltReason == nil && queue.systemPauseReason == nil
+                    && account.status.isUsable && queue.networkPauseReason != nil
+                if transientNetworkPause {
+                    let since = continuedUnwantedSince ?? Date()
+                    continuedUnwantedSince = since
+                    let remaining = ContinuedBackupPolicy.pauseGrace - Date().timeIntervalSince(since)
+                    if remaining > 0 {
+                        let progress = ContinuedBackupProgress(settledSinceStart: queue.settledRowCount - session.settledAtStart,
+                                                               unfinished: queue.activeCount)
+                        session.update(progress, subtitle: progress.subtitle(waitingFor: queue.networkPauseReason))
+                        continuedGraceCheck?.cancel()
+                        continuedGraceCheck = Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000) + 500_000_000)
+                            guard !Task.isCancelled else { return }
+                            self?.refreshContinuedBackup()
+                        }
+                        return
+                    }
+                }
+                continuedUnwantedSince = nil
+                continuedGraceCheck?.cancel()
+                continuedGraceCheck = nil
+                return endContinuedBackup(session)
+            }
+            continuedUnwantedSince = nil
+            continuedGraceCheck?.cancel()
+            continuedGraceCheck = nil
             let progress = ContinuedBackupProgress(settledSinceStart: queue.settledRowCount - session.settledAtStart,
                                                    unfinished: queue.activeCount)
             let waiting = queue.rateLimitPauseReason == nil ? nil : "Waiting: Google asked the app to slow down"
@@ -1193,6 +1274,9 @@ extension AutomaticBackupCoordinator {
     #if compiler(>=6.2)
     @available(iOS 26.0, *)
     private func endContinuedBackup(_ session: ContinuedBackupSession) {
+        continuedUnwantedSince = nil
+        continuedGraceCheck?.cancel()
+        continuedGraceCheck = nil
         let idle = queue.isIdle
         let reason = idle ? "nothing is left to back up" : (queue.pauseReason ?? "nothing can move on its own")
         DiagnosticEventLog.shared.record("scheduler", "Ended the background continuation: \(reason)")
@@ -1219,6 +1303,9 @@ extension AutomaticBackupCoordinator {
     /// Runs before iOS is told the task is over; unfinished work is requeued
     /// the same way as when a processing window expires.
     private func continuedBackupExpired() {
+        continuedUnwantedSince = nil
+        continuedGraceCheck?.cancel()
+        continuedGraceCheck = nil
         continuedRetryAfter = Date().addingTimeInterval(60)
         var lastItem = "no item had finished yet"
         #if compiler(>=6.2)
@@ -1226,12 +1313,18 @@ extension AutomaticBackupCoordinator {
             lastItem = "the last item finished \(Int(Date().timeIntervalSince(finished).rounded())) s earlier"
         }
         #endif
+        let thermal = ProcessInfo.processInfo.thermalState
         DiagnosticEventLog.shared.record(
             "scheduler",
-            "iOS ended the background continuation — Stop in the Live Activity, or iOS needed the CPU, memory or temperature headroom back; \(lastItem); \(DiagnosticProcessInfo.thermal(ProcessInfo.processInfo.thermalState)) thermal state. Unfinished work stays queued",
+            "iOS ended the background continuation — Stop in the Live Activity, or iOS needed the CPU, memory or temperature headroom back; \(lastItem); \(DiagnosticProcessInfo.thermal(thermal)) thermal state. Unfinished work stays queued",
             level: .warning
         )
-        // The keep-alive, when on, carries the queue on without the task.
+        // Respect thermal backpressure even when the keep-alive is on, so the
+        // app does not keep grinding while iOS says the phone is overheating.
+        if keepAlive.isRunning, thermal == .serious || thermal == .critical {
+            stopKeepAlive(because: "iOS reported \(DiagnosticProcessInfo.thermal(thermal)) thermal state")
+        }
+        // The keep-alive, when still on, carries the queue on without the task.
         if !keepAlive.isRunning {
             finishContinuedRun(success: false, ending: "iOS ended it")
             if UIApplication.shared.applicationState != .active {
@@ -1262,8 +1355,8 @@ extension AutomaticBackupCoordinator {
                                                queueCanMoveOnItsOwn: queueCanMoveOnItsOwn,
                                                accountUsable: account.status.isUsable)
         guard wanted else {
-            guard keepAlive.isRunning else { return }
-            let final = !preferences.keepAliveEnabled || queue.isIdle || !account.status.isUsable
+            guard keepAlive.mode != nil else { return }
+            let final = !preferences.keepAliveEnabled || queue.isIdle || queue.isUserPaused || !account.status.isUsable
             // A pause that can lift by itself (the network dropping for a
             // moment, a re-check of the connection) must not end the
             // keep-alive at once: it cannot be restarted from the background.
@@ -1283,6 +1376,7 @@ extension AutomaticBackupCoordinator {
             }
             let reason = !preferences.keepAliveEnabled ? "it was turned off"
                 : queue.isIdle ? "nothing is left to back up"
+                : queue.isUserPaused ? "you paused backup"
                 : !account.status.isUsable ? "the account needs attention"
                 : "\(queue.pauseReason ?? "nothing could move on its own") for \(Int(KeepAlivePolicy.pauseGrace)) s"
             stopKeepAlive(because: reason)
@@ -1292,7 +1386,7 @@ extension AutomaticBackupCoordinator {
         keepAliveGraceCheck?.cancel()
         keepAliveGraceCheck = nil
         let mode = preferences.keepAliveMode
-        guard keepAlive.mode != mode,
+        guard keepAlive.mode != mode || !keepAlive.isRunning,
               KeepAlivePolicy.canStart(isForeground: UIApplication.shared.applicationState == .active) else { return }
         if let retryAfter = keepAliveRetryAfter, Date() < retryAfter { return }
         do {
@@ -1350,7 +1444,32 @@ extension AutomaticBackupCoordinator {
         keepAliveGraceCheck = nil
         keepAlive.stop()
         DiagnosticEventLog.shared.record("keepalive", "Stopped the keep-alive: \(reason)")
+        // If stopping in the background with work still running (such as the
+        // 12-hour limit or an expired pause grace), requeue non-background
+        // tasks cleanly instead of letting iOS freeze them mid-export.
+        if UIApplication.shared.applicationState != .active, !continuesInBackground, !queue.isIdle {
+            queue.suspendForBackgroundExpiration()
+        }
         handBackToIOSIfNothingHoldsTheApp(success: queue.isIdle, ending: reason)
+    }
+
+    /// Another app temporarily took over audio. Disarm the preparation guard
+    /// and note the app as backgrounded so a jetsam during a long phone call
+    /// does not falsely penalize in-flight items as crashes.
+    private func keepAliveSuspended(_ reason: String) {
+        updateScreenSleep()
+        guard UIApplication.shared.applicationState != .active, !continuesInBackground else { return }
+        settleIntoSuspension()
+        DiagnosticEventLog.shared.flush()
+    }
+
+    /// Silent audio resumed after an interruption or audio route change.
+    private func keepAliveResumed() {
+        updateScreenSleep()
+        guard UIApplication.shared.applicationState != .active else { return }
+        queue.setPreparationGuardArmed(true)
+        queue.setICloudDownloadsAllowed(true)
+        AppSessionTracker.note(.backgroundWork)
     }
 
     /// iOS stopped the keep-alive from outside, such as a call taking the
@@ -1378,7 +1497,9 @@ extension AutomaticBackupCoordinator {
 
     var keepAliveStatus: String {
         guard preferences.keepAliveEnabled else { return "off" }
-        if let mode = keepAlive.mode { return "\(mode.title), running" }
+        if let mode = keepAlive.mode {
+            return keepAlive.isRunning ? "\(mode.title), running" : "\(mode.title), interrupted"
+        }
         return "\(preferences.keepAliveMode.title), idle"
     }
 
