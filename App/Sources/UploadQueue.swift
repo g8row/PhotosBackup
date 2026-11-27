@@ -210,6 +210,10 @@ final class UploadQueue: ObservableObject {
 
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
+    /// Reports whether the background URL session has already persisted a
+    /// completed transfer result for a row, so relaunch drains only attach to
+    /// finished transfers rather than spinning on unrelated in-flight uploads.
+    var hasCompletedBackgroundTransfer: ((UUID) -> Bool)?
 
     /// How many uploads the user may run at once. Bounded at the top because
     /// each in-flight item stages a full-size copy on disk and hashes it end to
@@ -1085,10 +1089,22 @@ final class UploadQueue: ObservableObject {
     private func nextStartableIndex() -> Int? {
         while scanCursor < items.count {
             if items[scanCursor].state == .queued {
-                // A pause still lets a row whose bytes are already moving in an
-                // iOS-owned background transfer come back to collect its result.
-                guard drainsBackgroundCompletionsOnly || isUserPaused else { return scanCursor }
-                if items[scanCursor].checkpoint?.isBackgroundTransfer == true { return scanCursor }
+                // A background-URLSession relaunch only commits transfers whose
+                // PUT has already finished (receipt in checkpoint or stored
+                // result on disk), leaving unrelated in-flight uploads to iOS.
+                if drainsBackgroundCompletionsOnly {
+                    let checkpoint = items[scanCursor].checkpoint
+                    let hasReceipt = checkpoint?.prepared?.receipt != nil
+                    let isBackground = checkpoint?.isBackgroundTransfer == true
+                    let hasStoredResult = hasCompletedBackgroundTransfer?(items[scanCursor].id) ?? true
+                    if hasReceipt || (isBackground && hasStoredResult) { return scanCursor }
+                } else if isUserPaused {
+                    // A pause still lets a row whose bytes are already moving in an
+                    // iOS-owned background transfer come back to collect its result.
+                    if items[scanCursor].checkpoint?.isBackgroundTransfer == true { return scanCursor }
+                } else {
+                    return scanCursor
+                }
             }
             scanCursor += 1
         }

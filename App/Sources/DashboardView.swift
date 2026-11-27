@@ -84,6 +84,7 @@ struct DashboardView: View {
     private func enqueue(_ sources: [MediaSource]) {
         guard !sources.isEmpty else { return }
         queue.reverify(sources)
+        automaticBackup.refreshBackgroundContinuation()
     }
 
     @ViewBuilder private var accountBanner: some View {
@@ -264,6 +265,7 @@ struct DashboardView: View {
                     try FolderScanner.sources(inPickedFolder: folderURL)
                 }.value
                 let queued = queue.enqueue(sources, skippingExisting: true).count
+                if queued > 0 { automaticBackup.refreshBackgroundContinuation() }
                 // Counts only: folder and file names stay out of the log.
                 DiagnosticEventLog.shared.record(
                     "queue", "Scanned a picked folder: \(sources.count) photos and videos, \(queued) newly queued")

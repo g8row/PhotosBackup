@@ -1545,6 +1545,58 @@ final class UploadQueueTests: XCTestCase {
         await settle(queue) { queue.items[1].state.isWorking }
         assertAggregatesMatchRows(queue)
     }
+
+    /// A background-URLSession relaunch only attaches to rows whose PUT has
+    /// already finished (a stored result on disk or a checkpointed receipt),
+    /// leaving unrelated in-flight uploads undisturbed so the relaunch handler
+    /// returns promptly instead of spinning for 25 s.
+    func testBackgroundTransferDrainSkipsInFlightUploadsWithoutStoredResult() async {
+        let finishedID = UUID()
+        let stillUploadingID = UUID()
+        let prepared = PreparedUpload(uploadURL: URL(string: "https://example.test/upload")!,
+                                      hash: Data(repeating: 1, count: 20), filename: "IMG.JPG",
+                                      modified: Date(timeIntervalSince1970: 100), byteCount: 100, receipt: nil)
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                          modified: Date(timeIntervalSince1970: 100), byteCount: 100,
+                                          temporary: true, prepared: prepared, continuesAfterProcessExit: true)
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version,
+            accountIdentifier: "person@gmail.com",
+            items: [
+                PersistedUploadItem(id: stillUploadingID, source: .asset("in-flight"), name: "BIG.MOV",
+                                    byteCount: 100, attempts: 1, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint),
+                PersistedUploadItem(id: finishedID, source: .asset("done-put"), name: "IMG.JPG",
+                                    byteCount: 100, attempts: 1, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint),
+            ],
+            completedSourceKeys: []
+        ))
+        let started = StartedIDs()
+        let worker: UploadWorker = { id, _, _, _, _ in
+            started.record(id)
+            return .uploaded(mediaKey: "KEY-\(id.uuidString)")
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 2, persistence: persistence)
+        queue.hasCompletedBackgroundTransfer = { $0 == finishedID }
+        queue.noteBackgroundTransferCompletionsPending()
+        queue.setNetworkAccess(allowed: false, pauseReason: "Restoring")
+        queue.activateAccount("person@gmail.com")
+        queue.setNetworkAccess(allowed: true)
+        queue.resumeBackgroundTransferCompletions()
+
+        await queue.waitUntilBackgroundTransfersHandled()
+        XCTAssertEqual(started.ids, [finishedID])
+        XCTAssertEqual(queue.items.first { $0.id == finishedID }?.state, .done)
+        XCTAssertEqual(queue.items.first { $0.id == stillUploadingID }?.state, .queued)
+    }
+}
+
+private final class StartedIDs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [UUID] = []
+    var ids: [UUID] { lock.sync { recorded } }
+    func record(_ id: UUID) { lock.sync { recorded.append(id) } }
 }
 
 final class ActivityListingTests: XCTestCase {

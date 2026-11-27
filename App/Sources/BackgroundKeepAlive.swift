@@ -69,9 +69,25 @@ final class BackgroundKeepAlive: NSObject {
     /// background: the audio session was taken over for good, or location
     /// access was revoked. The coordinator treats it like an expired window.
     var onLost: ((String) -> Void)?
+    /// Another app temporarily took over audio while the keep-alive waits for
+    /// the interruption to end. iOS may suspend the process during the gap, so
+    /// the coordinator disarms the crash-loop guard until playback resumes.
+    var onSuspended: ((String) -> Void)?
+    /// Silent audio resumed after an interruption or route change.
+    var onResumed: (() -> Void)?
+    /// The user granted location access after the settings prompt.
+    var onLocationAuthorized: (() -> Void)?
 
     private(set) var mode: KeepAliveMode?
-    var isRunning: Bool { mode != nil }
+    private(set) var isAudioInterrupted = false
+    /// True only while the keep-alive is actively holding the process awake.
+    var isRunning: Bool {
+        guard let mode else { return false }
+        switch mode {
+        case .audio: return !isAudioInterrupted && (player?.isPlaying == true)
+        case .location: return locationManager != nil
+        }
+    }
 
     private var player: AVAudioPlayer?
     private var locationManager: CLLocationManager?
@@ -80,7 +96,18 @@ final class BackgroundKeepAlive: NSObject {
     /// Start, or switch to, `mode`. Throws when iOS refuses, for example an
     /// audio session that cannot be activated or location access denied.
     func start(_ mode: KeepAliveMode) throws {
-        if self.mode == mode { return }
+        if self.mode == mode, isRunning { return }
+        // Check location authorization before stopping an active audio
+        // keep-alive, so opening the permission prompt does not drop audio
+        // before the user has even answered.
+        if mode == .location {
+            let status = (locationManager ?? CLLocationManager()).authorizationStatus
+            switch status {
+            case .authorizedAlways, .authorizedWhenInUse: break
+            case .notDetermined: throw KeepAliveError.locationNotYetAllowed
+            default: throw KeepAliveError.locationDenied
+            }
+        }
         stop()
         switch mode {
         case .audio: try startAudio()
@@ -92,6 +119,7 @@ final class BackgroundKeepAlive: NSObject {
     func stop() {
         player?.stop()
         player = nil
+        isAudioInterrupted = false
         if mode == .audio {
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }
@@ -108,6 +136,7 @@ final class BackgroundKeepAlive: NSObject {
     func requestLocationAuthorizationIfNeeded() {
         let manager = locationManager ?? CLLocationManager()
         if manager.authorizationStatus == .notDetermined {
+            manager.delegate = self
             pendingAuthorizationManager = manager
             manager.requestWhenInUseAuthorization()
         }
@@ -140,10 +169,25 @@ final class BackgroundKeepAlive: NSObject {
                 rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
             Task { @MainActor in self?.audioInterrupted(type, options: options) }
         })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
+                                            object: session, queue: .main) { [weak self] note in
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+                .flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
+            Task { @MainActor in self?.audioRouteChanged(reason) }
+        })
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
                                             object: session, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.resumeAudio(after: "the system audio service restarted") }
         })
+    }
+
+    /// Disconnecting headphones or Bluetooth audio causes iOS to pause
+    /// `AVAudioPlayer` automatically. Restart playback right away so iOS does
+    /// not silently suspend the process while `mode` still reads `.audio`.
+    private func audioRouteChanged(_ reason: AVAudioSession.RouteChangeReason?) {
+        guard mode == .audio, !isAudioInterrupted, reason == .oldDeviceUnavailable else { return }
+        guard player?.isPlaying != true else { return }
+        resumeAudio(after: "an audio output disconnected")
     }
 
     private func audioInterrupted(_ type: AVAudioSession.InterruptionType?,
@@ -151,7 +195,9 @@ final class BackgroundKeepAlive: NSObject {
         guard mode == .audio else { return }
         switch type {
         case .began:
+            isAudioInterrupted = true
             DiagnosticEventLog.shared.record("keepalive", "Another app took over audio; the keep-alive waits for it to finish")
+            onSuspended?("another app took over audio")
         case .ended where options.contains(.shouldResume):
             resumeAudio(after: "the audio interruption ended")
         case .ended:
@@ -175,7 +221,9 @@ final class BackgroundKeepAlive: NSObject {
             observers.forEach(NotificationCenter.default.removeObserver)
             observers = []
             try startAudio()
+            isAudioInterrupted = false
             DiagnosticEventLog.shared.record("keepalive", "Resumed the silent audio after \(reason)")
+            onResumed?()
         } catch {
             let message = "Could not resume the silent audio after \(reason): \(error.localizedDescription)"
             stop()
@@ -246,7 +294,14 @@ extension BackgroundKeepAlive: CLLocationManagerDelegate {
         let status = manager.authorizationStatus
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if status != .notDetermined { self.pendingAuthorizationManager = nil }
+            if status != .notDetermined {
+                self.pendingAuthorizationManager?.delegate = nil
+                self.pendingAuthorizationManager = nil
+            }
+            if status == .authorizedWhenInUse || status == .authorizedAlways {
+                self.onLocationAuthorized?()
+                return
+            }
             guard self.mode == .location, status == .denied || status == .restricted else { return }
             self.stop()
             self.onLost?("location access was turned off")

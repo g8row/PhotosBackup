@@ -55,7 +55,71 @@ final class BackgroundKeepAliveTests: XCTestCase {
         let keepAlive = BackgroundKeepAlive()
         try keepAlive.start(.audio)
         XCTAssertEqual(keepAlive.mode, .audio)
+        XCTAssertTrue(keepAlive.isRunning)
         keepAlive.stop()
         XCTAssertFalse(keepAlive.isRunning)
+    }
+
+    /// Attempting to switch to Location before authorization is granted keeps
+    /// the running audio keep-alive alive instead of dropping it first.
+    @MainActor
+    func testFailedSwitchToLocationPreservesRunningAudioKeepAlive() throws {
+        let keepAlive = BackgroundKeepAlive()
+        try keepAlive.start(.audio)
+        defer { keepAlive.stop() }
+        XCTAssertThrowsError(try keepAlive.start(.location))
+        XCTAssertEqual(keepAlive.mode, .audio)
+        XCTAssertTrue(keepAlive.isRunning)
+    }
+
+    /// An audio interruption pauses the keep-alive and invokes `onSuspended`;
+    /// ending with `.shouldResume` restores it, while ending without
+    /// `.shouldResume` stops it and invokes `onLost`.
+    @MainActor
+    func testAudioInterruptionSuspendsResumesAndLosesKeepAlive() async throws {
+        let keepAlive = BackgroundKeepAlive()
+        var suspendedReasons: [String] = []
+        var resumedCount = 0
+        var lostReasons: [String] = []
+        keepAlive.onSuspended = { suspendedReasons.append($0) }
+        keepAlive.onResumed = { resumedCount += 1 }
+        keepAlive.onLost = { lostReasons.append($0) }
+
+        try keepAlive.start(.audio)
+        defer { keepAlive.stop() }
+
+        let session = AVAudioSession.sharedInstance()
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: session,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
+        )
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(keepAlive.isAudioInterrupted)
+        XCTAssertFalse(keepAlive.isRunning)
+        XCTAssertEqual(suspendedReasons.count, 1)
+
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: session,
+            userInfo: [
+                AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue,
+                AVAudioSessionInterruptionOptionKey: AVAudioSession.InterruptionOptions.shouldResume.rawValue,
+            ]
+        )
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(keepAlive.isAudioInterrupted)
+        XCTAssertTrue(keepAlive.isRunning)
+        XCTAssertEqual(resumedCount, 1)
+
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: session,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
+        )
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(keepAlive.mode)
+        XCTAssertFalse(keepAlive.isRunning)
+        XCTAssertEqual(lostReasons.count, 1)
     }
 }
