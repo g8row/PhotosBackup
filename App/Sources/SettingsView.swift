@@ -6,6 +6,7 @@ struct SettingsView: View {
     @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
+    @EnvironmentObject private var dailyBudget: DailyUploadTracker
     @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
 
     let showTutorial: () -> Void
@@ -119,6 +120,16 @@ struct SettingsView: View {
     private var backupSection: some View {
         Section {
             Toggle("Automatic Backup", isOn: $preferences.automaticBackup)
+            Picker("Media Types", selection: $preferences.mediaFilter) {
+                ForEach(BackupMediaFilter.allCases) { option in Text(option.title).tag(option) }
+            }
+            Toggle("Only Back Up After Date", isOn: $preferences.backupFromDateEnabled)
+            if preferences.backupFromDateEnabled {
+                DatePicker("Start Date", selection: $preferences.backupFromDate, displayedComponents: [.date, .hourAndMinute])
+                Button("Set to Now") {
+                    preferences.backupFromDate = Date()
+                }
+            }
             Picker("Use Connection", selection: $preferences.connection) {
                 ForEach(BackupConnection.allCases) { option in Text(option.title).tag(option) }
             }
@@ -140,6 +151,21 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.orange)
             }
+            Picker("Daily Upload Limit", selection: $preferences.dailyUploadLimitBytes) {
+                ForEach(DailyUploadBudget.limitChoices, id: \.self) { limit in
+                    Text(DailyUploadBudget.label(for: limit)).tag(limit)
+                }
+            }
+            if preferences.dailyUploadLimitBytes > 0 {
+                Text("Uploaded today: \(DailyUploadBudget.formatBytes(dailyBudget.usedTodayBytes)) of \(DailyUploadBudget.formatBytes(preferences.dailyUploadLimitBytes))")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            if let reason = queue.dailyLimitPauseReason {
+                Label(reason, systemImage: "speedometer")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
             Picker("Simultaneous Uploads", selection: $preferences.concurrentUploads) {
                 ForEach(Array(UploadQueue.concurrencyRange), id: \.self) { count in
                     Text(count.formatted()).tag(count)
@@ -148,11 +174,12 @@ struct SettingsView: View {
             Toggle("Storage Saver", isOn: $preferences.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
             Toggle("Back Up Live Photo Motion", isOn: $preferences.backUpLivePhotoMotion)
+            Toggle("Back Up Edited Photo Originals", isOn: $preferences.backUpEditedPhotoOriginals)
             Toggle("Add to Matching Albums", isOn: $preferences.albumsFromLibrary)
         } header: {
             Text("Backup")
         } footer: {
-            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality.\n\nBack Up Live Photo Motion attaches each Live Photo's motion to its photo, so it plays as a Live Photo in Google Photos and the Google Photos app's Free up space can remove it from this iPhone. It uploads the short video too, a few MB per Live Photo, and uses storage the same way the photo does. Live Photos backed up earlier get their motion added in the background.\n\nAdd to Matching Albums puts each new upload into a Google Photos album with the same name as each of your albums holding it, or for a file from a picked folder, the folder holding it, creating the album the first time. Photos backed up before it was turned on are not moved.")
+            Text("Media Types and Only Back Up After Date filter selected albums and picked folders without changing what is already backed up. Daily Upload Limit counts bytes actually uploaded each day (items already in Google Photos don't count) and resumes automatically tomorrow.\n\nMore simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality.\n\nBack Up Live Photo Motion attaches each Live Photo's motion to its photo, so it plays as a Live Photo in Google Photos and the Google Photos app's Free up space can remove it from this iPhone. It uploads the short video too, a few MB per Live Photo, and uses storage the same way the photo does. Live Photos backed up earlier get their motion added in the background.\n\nBack Up Edited Photo Originals also uploads the unedited original beside the edited version of photos you edited in Photos. Turning this on queues unedited originals for edited photos already backed up.\n\nAdd to Matching Albums puts each new upload into a Google Photos album with the same name as each of your albums holding it, or for a file from a picked folder, the folder holding it, creating the album the first time. Photos backed up before it was turned on are not moved.")
         }
     }
 

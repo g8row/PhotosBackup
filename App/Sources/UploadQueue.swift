@@ -128,6 +128,7 @@ private extension MediaSource {
         case .livePhotoMotion(let identifier): return UploadQueue.motionKeyPrefix + identifier
         case .editBase(let identifier): return UploadQueue.editBaseKeyPrefix + identifier
         case .videoOriginal(let identifier): return UploadQueue.videoOriginalKeyPrefix + identifier
+        case .photoOriginal(let identifier): return UploadQueue.photoOriginalKeyPrefix + identifier
         case .folderFile(let folderID, let relativePath): return "folder:\(folderID)/\(relativePath)"
         }
     }
@@ -139,6 +140,11 @@ private extension MediaSource {
 
     var isVideoOriginal: Bool {
         if case .videoOriginal = self { return true }
+        return false
+    }
+
+    var isPhotoOriginal: Bool {
+        if case .photoOriginal = self { return true }
         return false
     }
 
@@ -183,6 +189,8 @@ final class UploadQueue: ObservableObject {
     @Published private(set) var networkPauseReason: String?
     /// Non-nil while the selected charging / battery policy pauses uploads.
     @Published private(set) var powerPauseReason: String?
+    /// Non-nil once uploads have reached the user's daily data limit.
+    @Published private(set) var dailyLimitPauseReason: String?
     /// Set when iOS ends a background execution window before the queue drains.
     @Published private(set) var systemPauseReason: String?
     /// Set while Google refuses requests for going over its per-minute limit
@@ -216,6 +224,9 @@ final class UploadQueue: ObservableObject {
 
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
+    /// Called when an item finishes an actual file upload (not a duplicate-check hit)
+    /// with the number of bytes transferred, so the daily upload budget can track it.
+    var onBytesUploaded: ((Int64) -> Void)?
     /// Reports whether the background URL session has already persisted a
     /// completed transfer result for a row, so relaunch drains only attach to
     /// finished transfers rather than spinning on unrelated in-flight uploads.
@@ -408,6 +419,7 @@ final class UploadQueue: ObservableObject {
             ?? (isUserPaused ? "You paused backup. Tap Resume to continue." : nil)
             ?? networkPauseReason
             ?? powerPauseReason
+            ?? dailyLimitPauseReason
             ?? systemPauseReason
             ?? rateLimitPauseReason
     }
@@ -686,6 +698,7 @@ final class UploadQueue: ObservableObject {
             $0.hasPrefix(Self.motionKeyPrefix) || $0.hasPrefix(Self.editBaseKeyPrefix)
                 || $0.hasPrefix(Self.editStateKeyPrefix)
                 || $0.hasPrefix(Self.videoOriginalKeyPrefix)
+                || $0.hasPrefix(Self.photoOriginalKeyPrefix)
         }.count
     }
 
@@ -768,6 +781,9 @@ final class UploadQueue: ObservableObject {
 
     /// Ledger prefix of an edited video's original, keyed by asset.
     nonisolated static let videoOriginalKeyPrefix = "videooriginal:"
+
+    /// Ledger prefix of an edited photo's unedited original, keyed by asset.
+    nonisolated static let photoOriginalKeyPrefix = "photooriginal:"
 
     /// Ledger prefix of a Live Photo motion, keyed by its asset identifier.
     nonisolated static let motionKeyPrefix = "motion:"
@@ -1041,6 +1057,21 @@ final class UploadQueue: ObservableObject {
         else { cancelRunningForRequeue(includingBackgroundTransfers: false) }
     }
 
+    /// Apply the user-selected daily upload data limit (issue #14). Stops
+    /// starting new uploads once the limit is reached without cancelling
+    /// transfers already handed off to iOS.
+    func setDailyLimitAccess(allowed: Bool, pauseReason: String? = nil) {
+        let nextReason = allowed ? nil : (pauseReason ?? "Daily upload limit reached")
+        guard dailyLimitPauseReason != nextReason else { return }
+        dailyLimitPauseReason = nextReason
+        DiagnosticEventLog.shared.record(
+            "queue",
+            allowed ? "Daily upload budget allows uploads" : "Daily upload budget paused uploads: \(nextReason ?? "unknown")"
+        )
+        if allowed { pump() }
+        else { cancelRunningForRequeue(includingBackgroundTransfers: false) }
+    }
+
     /// Arm the crash-loop guard while the app executes with iOS's blessing —
     /// open, or inside a background window — and disarm it when the process is
     /// about to be suspended. A suspended process can be killed at any moment
@@ -1116,7 +1147,8 @@ final class UploadQueue: ObservableObject {
         while !isIdle {
             if Task.isCancelled { return false }
             if let deadline, Date() >= deadline { return false }
-            if networkPauseReason != nil || powerPauseReason != nil || systemPauseReason != nil { return false }
+            if networkPauseReason != nil || powerPauseReason != nil
+                || dailyLimitPauseReason != nil || systemPauseReason != nil { return false }
             if isUserPaused && running.isEmpty { return false }
             if running.isEmpty && !hasWorkableItems {
                 return haltReason == nil
@@ -1134,7 +1166,8 @@ final class UploadQueue: ObservableObject {
         while !isIdle {
             if Task.isCancelled { return false }
             if let deadline, Date() >= deadline { return false }
-            if networkPauseReason != nil || powerPauseReason != nil || systemPauseReason != nil { return false }
+            if networkPauseReason != nil || powerPauseReason != nil
+                || dailyLimitPauseReason != nil || systemPauseReason != nil { return false }
             if isUserPaused && running.isEmpty { return false }
             if running.isEmpty && !hasWorkableItems {
                 return haltReason == nil
@@ -1212,7 +1245,7 @@ final class UploadQueue: ObservableObject {
 
     private func pump() {
         guard haltReason == nil, networkPauseReason == nil, powerPauseReason == nil,
-              systemPauseReason == nil, rateLimitPauseReason == nil else { return }
+              dailyLimitPauseReason == nil, systemPauseReason == nil, rateLimitPauseReason == nil else { return }
         while canStartAnotherRow(), let index = nextStartableIndex() {
             start(at: index)
         }
@@ -1310,6 +1343,8 @@ final class UploadQueue: ObservableObject {
         switch outcome {
         case .success(let result):
             let settled: UploadItem.State = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
+            let uploadedBytes: Int64
+            if case .uploaded = result { uploadedBytes = max(0, items[index].byteCount) } else { uploadedBytes = 0 }
             items[index].mediaKey = result.mediaKey
             setState(settled, at: index)
             completedSourceKeys.formUnion(completionKeys(for: items[index]))
@@ -1317,6 +1352,7 @@ final class UploadQueue: ObservableObject {
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
             persist()
+            if uploadedBytes > 0 { onBytesUploaded?(uploadedBytes) }
             if let followUps = followUpSources?(items[index].source), !followUps.isEmpty {
                 enqueue(followUps, skippingExisting: true)
             }
@@ -1585,6 +1621,7 @@ final class UploadQueue: ObservableObject {
             let motion: Bool? = item.source.isLivePhotoMotion ? true : nil
             let editBase: Bool? = item.source.isEditBase ? true : nil
             let videoOriginal: Bool? = item.source.isVideoOriginal ? true : nil
+            let photoOriginal: Bool? = item.source.isPhotoOriginal ? true : nil
             let forceUpload: Bool? = item.forcesUpload ? true : nil
             switch item.state {
             case .alreadyBackedUp, .done:
@@ -1596,14 +1633,14 @@ final class UploadQueue: ObservableObject {
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: nil, failureRetryable: false,
                                            checkpoint: nil, cancelled: true, motion: motion, editBase: editBase,
-                                           videoOriginal: videoOriginal, forceUpload: forceUpload)
+                                           videoOriginal: videoOriginal, photoOriginal: photoOriginal, forceUpload: forceUpload)
             case .failed(let reason, let retryable):
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
                                            failureReason: reason, failureRetryable: retryable,
                                            checkpoint: item.checkpoint,
                                            interruptedPreparations: interruptions, motion: motion, editBase: editBase,
-                                           videoOriginal: videoOriginal, forceUpload: forceUpload)
+                                           videoOriginal: videoOriginal, photoOriginal: photoOriginal, forceUpload: forceUpload)
             default:
                 // Working and retry-delay states intentionally restore queued.
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
@@ -1611,7 +1648,7 @@ final class UploadQueue: ObservableObject {
                                            failureReason: nil, failureRetryable: false,
                                            checkpoint: item.checkpoint,
                                            interruptedPreparations: interruptions, motion: motion, editBase: editBase,
-                                           videoOriginal: videoOriginal, forceUpload: forceUpload)
+                                           videoOriginal: videoOriginal, photoOriginal: photoOriginal, forceUpload: forceUpload)
             }
         }
         let snapshot = UploadQueueSnapshot(

@@ -9,6 +9,7 @@ struct PhotosBackupApp: App {
     @StateObject private var queue: UploadQueue
     @StateObject private var preferences: BackupPreferences
     @StateObject private var albums: PhotoAlbumStore
+    @StateObject private var dailyBudget: DailyUploadTracker
     @Environment(\.scenePhase) private var scenePhase
     private let network: NetworkPolicyMonitor
     private let power: PowerPolicyMonitor
@@ -20,6 +21,7 @@ struct PhotosBackupApp: App {
         let stack = PhotosStack()
         let preferences = BackupPreferences()
         let albums = PhotoAlbumStore()
+        let dailyBudget = DailyUploadTracker()
         let network = NetworkPolicyMonitor()
         let power = PowerPolicyMonitor()
         stack.queue.options.storageSaver = preferences.storageSaver
@@ -33,7 +35,8 @@ struct PhotosBackupApp: App {
             preferences: preferences,
             albums: albums,
             network: network,
-            power: power
+            power: power,
+            dailyBudget: dailyBudget
         )
         BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
             await automaticBackup?.handleBackgroundURLSessionEvents()
@@ -47,6 +50,7 @@ struct PhotosBackupApp: App {
         _queue = StateObject(wrappedValue: stack.queue)
         _preferences = StateObject(wrappedValue: preferences)
         _albums = StateObject(wrappedValue: albums)
+        _dailyBudget = StateObject(wrappedValue: dailyBudget)
         self.network = network
         self.power = power
         self.automaticBackup = automaticBackup
@@ -65,6 +69,7 @@ struct PhotosBackupApp: App {
         power.start()
         automaticBackup.applyNetworkPolicy()
         automaticBackup.applyPowerPolicy()
+        automaticBackup.applyDailyLimitPolicy()
     }
 
     var body: some Scene {
@@ -76,6 +81,7 @@ struct PhotosBackupApp: App {
                 .environmentObject(queue)
                 .environmentObject(preferences)
                 .environmentObject(albums)
+                .environmentObject(dailyBudget)
                 .environmentObject(automaticBackup)
                 .task { await automaticBackup.start() }
                 .onChange(of: scenePhase) { phase in
@@ -113,6 +119,28 @@ struct PhotosBackupApp: App {
                 .onChange(of: preferences.backUpLivePhotoMotion) { value in
                     DiagnosticEventLog.shared.record("settings", "Back Up Live Photo Motion turned \(value ? "on" : "off")")
                     automaticBackup.livePhotoMotionPreferenceDidChange()
+                }
+                .onChange(of: preferences.backUpEditedPhotoOriginals) { value in
+                    DiagnosticEventLog.shared.record("settings", "Back Up Edited Photo Originals turned \(value ? "on" : "off")")
+                    automaticBackup.editedPhotoOriginalsPreferenceDidChange()
+                }
+                .onChange(of: preferences.mediaFilter) { value in
+                    DiagnosticEventLog.shared.record("settings", "Media Types set to \(value.title)")
+                    automaticBackup.backupConfigurationDidChange()
+                }
+                .onChange(of: preferences.backupFromDateEnabled) { value in
+                    DiagnosticEventLog.shared.record("settings", "Only Back Up After Date turned \(value ? "on" : "off")")
+                    automaticBackup.backupConfigurationDidChange()
+                }
+                .onChange(of: preferences.backupFromDate) { _ in
+                    if preferences.backupFromDateEnabled {
+                        DiagnosticEventLog.shared.record("settings", "Backup cutoff date updated")
+                        automaticBackup.backupConfigurationDidChange()
+                    }
+                }
+                .onChange(of: preferences.dailyUploadLimitBytes) { value in
+                    DiagnosticEventLog.shared.record("settings", "Daily Upload Limit set to \(DailyUploadBudget.label(for: value))")
+                    automaticBackup.dailyUploadLimitDidChange()
                 }
                 .onChange(of: preferences.keepAliveEnabled) { value in
                     DiagnosticEventLog.shared.record("settings", "Keep Running in Background turned \(value ? "on" : "off")")

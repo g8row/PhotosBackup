@@ -33,6 +33,10 @@ enum MediaSource: Equatable, Sendable {
     /// account, the Google Photos app did not count Cinematic videos as backed
     /// up; it did once the originals were added (seen on device on 2026-10-31).
     case videoOriginal(localIdentifier: String)
+    /// The unedited file of the edited photo with this `PHAsset` identifier
+    /// (`.photo`), backed up beside its rendered edit when the user opts into
+    /// keeping originals of edited photos (issue #33).
+    case photoOriginal(localIdentifier: String)
     /// A photo or video inside a folder picked from the Files app, outside
     /// the photo library: the folder's `PickedFolderStore` id and the file's
     /// path inside it. Copied into staging at export time, while the folder's
@@ -87,6 +91,7 @@ actor MediaExporter {
         case noMotion
         case noEditBase
         case noVideoOriginal
+        case noPhotoOriginal
         case iCloudDownloadRequired
         var errorDescription: String? {
             switch self {
@@ -96,6 +101,7 @@ actor MediaExporter {
             case .noMotion: return "That Live Photo has no motion to back up."
             case .noEditBase: return "That photo has no Google Photos edit to back up the base of."
             case .noVideoOriginal: return "That video has no separate original to back up."
+            case .noPhotoOriginal: return "That photo has no separate original to back up."
             case .iCloudDownloadRequired: return "That item is only in iCloud. It will continue when the app is open."
             case .unreadable(let detail): return "Could not read that item: \(detail)"
             }
@@ -185,6 +191,8 @@ actor MediaExporter {
             return try await exportEditBase(identifier, allowsNetworkAccess: allowsNetworkAccess)
         case .videoOriginal(let identifier):
             return try await exportVideoOriginal(identifier, allowsNetworkAccess: allowsNetworkAccess)
+        case .photoOriginal(let identifier):
+            return try await exportPhotoOriginal(identifier, allowsNetworkAccess: allowsNetworkAccess)
         case .folderFile(let folderID, let relativePath):
             // Detached: the coordinated read blocks, for as long as an iCloud
             // Drive download takes, and must not hold up this actor.
@@ -349,6 +357,23 @@ actor MediaExporter {
         guard Self.hasVideoOriginal(asset),
               let original = PHAssetResource.assetResources(for: asset).first(where: { $0.type == .video }) else {
             throw Failure.noVideoOriginal
+        }
+        return try await stage(original, as: original.originalFilename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
+    }
+
+    /// Whether a photo keeps an unedited original apart from what `.asset` uploads.
+    static func hasPhotoOriginal(_ asset: PHAsset) -> Bool {
+        asset.mediaType == .image && asset.hasAdjustments
+    }
+
+    /// The unedited file of an edited photo, under its own name (issue #33).
+    private func exportPhotoOriginal(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: .includingBurstFrames).firstObject else {
+            throw Failure.missingAsset
+        }
+        guard Self.hasPhotoOriginal(asset),
+              let original = PHAssetResource.assetResources(for: asset).first(where: { $0.type == .photo }) else {
+            throw Failure.noPhotoOriginal
         }
         return try await stage(original, as: original.originalFilename, of: asset, allowsNetworkAccess: allowsNetworkAccess)
     }

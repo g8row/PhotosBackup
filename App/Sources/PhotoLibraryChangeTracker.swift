@@ -39,8 +39,16 @@ final class PhotoLibraryChangeTracker {
 
     /// Scan the library off the main actor so a full-library fallback on a
     /// large library cannot block background expiry handling or UI turns.
-    func scan(albums: PhotoAlbumStore, selectedAlbumIDs: Set<String>, accountIdentifier: String?) async -> Scan {
-        let context = ([accountIdentifier?.lowercased() ?? ""] + selectedAlbumIDs.sorted())
+    func scan(
+        albums: PhotoAlbumStore,
+        selectedAlbumIDs: Set<String>,
+        accountIdentifier: String?,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) async -> Scan {
+        let cutoffKey = cutoffDate.map { String(Int64($0.timeIntervalSince1970.rounded())) } ?? "none"
+        let context = ([accountIdentifier?.lowercased() ?? "", mediaFilter.rawValue, cutoffKey]
+            + selectedAlbumIDs.sorted())
             .joined(separator: "\u{1F}")
         let targets = albums.scanTargets(for: selectedAlbumIDs)
         let stored = load()
@@ -48,6 +56,8 @@ final class PhotoLibraryChangeTracker {
             Self.performScan(
                 targets: targets,
                 selectedAlbumIDs: selectedAlbumIDs,
+                mediaFilter: mediaFilter,
+                cutoffDate: cutoffDate,
                 context: context,
                 stored: stored
             )
@@ -57,11 +67,13 @@ final class PhotoLibraryChangeTracker {
     private nonisolated static func performScan(
         targets: [(id: String, collection: PHAssetCollection?)],
         selectedAlbumIDs: Set<String>,
+        mediaFilter: BackupMediaFilter,
+        cutoffDate: Date?,
         context: String,
         stored: StoredState?
     ) -> Scan {
         guard #available(iOS 16, *) else {
-            let sources = PhotoAlbumStore.sources(for: targets)
+            let sources = PhotoAlbumStore.sources(for: targets, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
             DiagnosticEventLog.shared.record(
                 "library",
                 "Scanned the selected albums in full (iOS 15 keeps no change history): \(sources.count) items"
@@ -74,10 +86,10 @@ final class PhotoLibraryChangeTracker {
         let next = archive(current).map { StoredState(context: context, token: $0) }
         guard let stored, stored.context == context,
               let token = unarchive(stored.token) else {
-            let sources = PhotoAlbumStore.sources(for: targets)
+            let sources = PhotoAlbumStore.sources(for: targets, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
             let why = stored == nil
                 ? "no earlier scan to compare with"
-                : "the album selection or account changed since the last scan"
+                : "the album selection, filters, or account changed since the last scan"
             DiagnosticEventLog.shared.record(
                 "library",
                 "Scanned the selected albums in full (\(why)): \(sources.count) items"
@@ -108,10 +120,22 @@ final class PhotoLibraryChangeTracker {
             // An asset can appear in both sets across a batch of changes; a new
             // asset is not an edit, so insertion wins.
             updated.subtract(inserted)
-            let edited = PhotoAlbumStore.sources(for: targets, selectedAlbumIDs: selectedAlbumIDs, matching: updated)
+            let edited = PhotoAlbumStore.sources(
+                for: targets,
+                selectedAlbumIDs: selectedAlbumIDs,
+                matching: updated,
+                mediaFilter: mediaFilter,
+                cutoffDate: cutoffDate
+            )
             let sources = selectedCollectionChanged
-                ? PhotoAlbumStore.sources(for: targets)
-                : PhotoAlbumStore.sources(for: targets, selectedAlbumIDs: selectedAlbumIDs, matching: inserted.union(updated))
+                ? PhotoAlbumStore.sources(for: targets, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
+                : PhotoAlbumStore.sources(
+                    for: targets,
+                    selectedAlbumIDs: selectedAlbumIDs,
+                    matching: inserted.union(updated),
+                    mediaFilter: mediaFilter,
+                    cutoffDate: cutoffDate
+                )
             DiagnosticEventLog.shared.record(
                 "library",
                 selectedCollectionChanged
@@ -122,7 +146,7 @@ final class PhotoLibraryChangeTracker {
         } catch {
             // Expired/unavailable history requires one correctness-first current
             // scan, after which the fresh token becomes the new baseline.
-            let sources = PhotoAlbumStore.sources(for: targets)
+            let sources = PhotoAlbumStore.sources(for: targets, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
             DiagnosticEventLog.shared.record(
                 "library",
                 "The library's change history was unavailable (\(error.localizedDescription)), so the selection was scanned in full: \(sources.count) items",

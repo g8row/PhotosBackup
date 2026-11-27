@@ -124,6 +124,12 @@ enum DiagnosticReportBuilder {
         field("Observed network", scheduler.networkStatus)
         field("Only while charging", preferences.onlyWhileCharging)
         field("Minimum battery", preferences.minimumBatteryPercent == 0 ? "off" : "\(preferences.minimumBatteryPercent)%")
+        field("Media filter", preferences.mediaFilter.rawValue)
+        field("Backup cutoff date", preferences.backupCutoffDate.map(formatter.string(from:)) ?? "off")
+        field("Daily upload limit", preferences.dailyUploadLimitBytes == 0
+              ? "off"
+              : "\(DailyUploadBudget.formatBytes(preferences.dailyUploadLimitBytes)) (used today: \(DailyUploadBudget.formatBytes(automaticBackup.dailyBudget.usedTodayBytes)))")
+        field("Back up edited photo originals", preferences.backUpEditedPhotoOriginals)
         field("Wake on location change", preferences.significantLocationWake)
         field("Simultaneous uploads", preferences.concurrentUploads)
         field("Storage Saver", preferences.storageSaver)
