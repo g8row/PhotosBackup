@@ -22,6 +22,7 @@ struct PhotosBackupApp: App {
         let network = NetworkPolicyMonitor()
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
+        stack.queue.options.filesIntoAlbums = preferences.albumsFromLibrary
         stack.queue.setMaxConcurrent(preferences.concurrentUploads)
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
@@ -94,6 +95,10 @@ struct PhotosBackupApp: App {
                 .onChange(of: preferences.useQuota) { value in
                     DiagnosticEventLog.shared.record("settings", "Count Against Storage Quota turned \(value ? "on" : "off")")
                     queue.options.useQuota = value
+                }
+                .onChange(of: preferences.albumsFromLibrary) { value in
+                    DiagnosticEventLog.shared.record("settings", "Add to Matching Albums turned \(value ? "on" : "off")")
+                    queue.options.filesIntoAlbums = value
                 }
                 .onChange(of: preferences.backUpLivePhotoMotion) { value in
                     DiagnosticEventLog.shared.record("settings", "Back Up Live Photo Motion turned \(value ? "on" : "off")")

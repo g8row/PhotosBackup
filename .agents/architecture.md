@@ -36,6 +36,8 @@ Generated `PhotosBackup.xcodeproj` is disposable — regenerate, don't hand-edit
 | `AutomaticBackupCoordinator` | AutomaticBackupCoordinator.swift | BGProcessingTask scheduling; batches: 25/background window, 250/foreground. On iOS 26 also holds a `BGContinuedProcessingTask` (`ContinuedBackup.swift`) whenever the open app has work, so the queue keeps running after the app is backgrounded (max 2 concurrent there); the other background paths skip their suspend while it is active |
 | `NetworkPolicy` / monitor | NetworkPolicy.swift | Wi-Fi-only vs Wi-Fi+cellular, enforced at queue + request level |
 | `CredentialStore` | CredentialStore.swift | Single Keychain item, `AfterFirstUnlockThisDeviceOnly` |
+| `PickedFolderStore` / `FolderScanner` | FolderImport.swift | Folders picked from Files / iCloud Drive (Dashboard "Pick Folder"): bookmarks keyed by id, recursive media scan into `.folderFile(folderID:relativePath:)` sources; the exporter copies each file into staging under the folder's security-scoped access. Album filing uses the file's parent folder name |
+| `GoogleAlbumRegistry` / `GoogleAlbumFiler` | GoogleAlbums.swift | "Add to Matching Albums": per-account JSON of album name → Google album key; files each upload into albums named after its iOS albums (or its folder) |
 | `MediaExport` / `PhotosUploader` | MediaExport.swift / PhotosUploader.swift | PHAsset export → hash → duplicate-check → upload → finalize; Live Photos = still, then motion attached as a separate `livePhotoMotion` row; a photo edited in the Google Photos app (`com.google.photos.editing.filtering.nondestructive`) also gets an `editBase` row uploading `.adjustmentBasePhoto`, the version that app checks |
 
 ## Data flow

@@ -5,6 +5,9 @@ import Foundation
 enum PersistedMediaSource: Codable, Equatable, Sendable {
     case asset(String)
     case file(String)
+    /// A file in a picked folder. Builds that predate it cannot read a
+    /// snapshot holding one; this build reads theirs unchanged.
+    case folderFile(folderID: String, relativePath: String)
 
     init?(_ source: MediaSource) {
         switch source {
@@ -15,6 +18,7 @@ enum PersistedMediaSource: Codable, Equatable, Sendable {
              .videoOriginal(let identifier):
             self = .asset(identifier)
         case .file(let url): self = .file(url.standardizedFileURL.path)
+        case .folderFile(let folderID, let relativePath): self = .folderFile(folderID: folderID, relativePath: relativePath)
         case .picked: return nil
         }
     }
@@ -23,6 +27,7 @@ enum PersistedMediaSource: Codable, Equatable, Sendable {
         switch self {
         case .asset(let identifier): return .asset(localIdentifier: identifier)
         case .file(let path): return .file(URL(fileURLWithPath: path))
+        case .folderFile(let folderID, let relativePath): return .folderFile(folderID: folderID, relativePath: relativePath)
         }
     }
 }
