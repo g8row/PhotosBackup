@@ -73,12 +73,14 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
     let editBase: Bool?
     /// True for an edited video's original row, stored the same way.
     let videoOriginal: Bool?
+    /// True for a row the user asked to upload again. Nil otherwise.
+    let forceUpload: Bool?
 
     init(id: UUID, source: PersistedMediaSource, name: String, byteCount: Int64,
          attempts: Int, failureReason: String?, failureRetryable: Bool,
          checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil,
          interruptedPreparations: Int? = nil, motion: Bool? = nil, editBase: Bool? = nil,
-         videoOriginal: Bool? = nil) {
+         videoOriginal: Bool? = nil, forceUpload: Bool? = nil) {
         self.id = id
         self.source = source
         self.name = name
@@ -92,6 +94,7 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
         self.motion = motion
         self.editBase = editBase
         self.videoOriginal = videoOriginal
+        self.forceUpload = forceUpload
     }
 
     var mediaSource: MediaSource {

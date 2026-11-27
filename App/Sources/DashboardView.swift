@@ -401,6 +401,7 @@ struct DashboardView: View {
         case .nothingToDo: return "Everything in your selected albums is already backed up."
         case .started(let count): return "Backing up \(count.formatted()) items. Watch progress in Activity."
         case .rechecking(let count): return "Re-checking \(count.formatted()) items against Google Photos."
+        case .reuploading(let count): return "Uploading \(count.formatted()) items again. Watch progress in Activity."
         }
     }
 

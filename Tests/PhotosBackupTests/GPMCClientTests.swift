@@ -572,6 +572,17 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertFalse(phases.phases.contains { if case .sending = $0 { return true }; return false })
     }
 
+    /// Re-upload has to reach the transfer even for bytes Google already holds,
+    /// so it never asks for the existing copy.
+    func testSkippingTheDuplicateCheckPreparesAnUploadForBytesGoogleHolds() async throws {
+        StubProtocol.handler = Self.photosHandler(existingKey: "EXISTING")
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        let preparation = try await client.prepareUpload(file: try scratchFile(), filename: "IMG_0002.JPG",
+                                                         skippingDuplicateCheck: true) { _ in }
+        guard case .ready = preparation else { return XCTFail("expected an upload, got \(preparation)") }
+        XCTAssertFalse(StubProtocol.seen.contains { $0.stubPath.hasSuffix("/5084965799730810217") })
+    }
+
     func testEmptyFileIsRefusedBeforeAnyRequest() async throws {
         StubProtocol.handler = Self.photosHandler()
         let file = try scratchFile(0, name: "empty.jpg")

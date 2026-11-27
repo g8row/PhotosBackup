@@ -44,6 +44,13 @@ private extension NSLock {
     func sync<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }
 
+/// What each worker call was told about the duplicate check, in call order.
+final class SkipRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Bool] = []
+    var calls: [Bool] { lock.sync { recorded } }
+    func record(_ skipsDuplicateCheck: Bool) { lock.sync { recorded.append(skipsDuplicateCheck) } }
+}
 
 /// A queue sleeper that records each requested delay and holds every sleeper
 /// until the test opens it.
@@ -844,6 +851,38 @@ final class UploadQueueTests: XCTestCase {
         queue.activateAccount("person@gmail.com")
         await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
         XCTAssertFalse(queue.needsRecheck(assetIdentifier: "asset-1", editMark: "t1790000000000"))
+    }
+
+    /// Re-upload queues a backed-up asset again and has its row skip the
+    /// duplicate check; an ordinary row still runs it.
+    func testReuploadQueuesABackedUpAssetThatSkipsTheDuplicateCheck() async {
+        let skipped = SkipRecorder()
+        let worker: UploadWorker = { _, _, _, options, _ in
+            skipped.record(options.skipsDuplicateCheck)
+            return .alreadyBackedUp(mediaKey: "KEY")
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
+
+        XCTAssertEqual(queue.reupload([.asset(localIdentifier: "asset-1")]), 1)
+        await settle(queue) { queue.items.count == 1 && queue.items.first?.state == .alreadyBackedUp }
+        XCTAssertEqual(skipped.calls, [false, true])
+    }
+
+    /// A re-upload row that outlives the process still skips the check.
+    func testAReuploadRowRestoresAsOne() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("person@gmail.com")
+        first.reupload([.asset(localIdentifier: "asset-1")])
+        XCTAssertEqual(persistence.snapshot?.items.first?.forceUpload, true)
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        XCTAssertEqual(restored.items.first?.forcesUpload, true)
     }
 
     func testAMotionCheckpointKeepsItsStillHash() throws {
