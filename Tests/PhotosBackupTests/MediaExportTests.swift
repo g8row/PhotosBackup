@@ -51,6 +51,14 @@ final class MediaExportTests: XCTestCase {
         XCTAssertEqual(MediaExporter.motionResourceTypes(edited: true).first, .fullSizePairedVideo)
     }
 
+    /// PhotoKit shows one frame of a burst unless asked. Seen on device on
+    /// 2026-11-16: the hidden frame of a two-frame burst was never queued, and
+    /// the Google Photos app called the burst not backed up.
+    func testLibraryReadsIncludeEveryBurstFrame() {
+        XCTAssertTrue(PHFetchOptions.includingBurstFrames.includeAllBurstAssets)
+        XCTAssertTrue(PhotoAlbumStore.allPhotosOptions().includeAllBurstAssets)
+    }
+
     func testARenderedEditIsUploadedUnderTheOriginalName() {
         XCTAssertEqual(MediaExporter.uploadFilename(original: "IMG_0351.HEIC", rendition: "FullSizeRender.heic"), "IMG_0351.HEIC")
         XCTAssertEqual(MediaExporter.uploadFilename(original: "IMG_0007.PNG", rendition: "FullSizeRender.heic"), "IMG_0007.HEIC")

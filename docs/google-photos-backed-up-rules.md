@@ -31,6 +31,9 @@ Google Photos app would upload itself for the item on the iPhone.
   with only their rendered edits uploaded, and none did once their originals
   were added. All 62 originals went up together, so this does not show which
   videos needed one. The camera saves every Cinematic video as edited.
+- **Bursts.** Every frame counts, including the frames Photos hides inside the
+  burst. On 16 Nov 2026 a two-frame burst showed "not backed up" with only the
+  frame Photos shows uploaded, and counted once the hidden frame was added.
 - **Archive.** Archiving the matching item un-counts the photo.
 - **Editing again.** A photo edited again is not backed up until its new
   render is uploaded.
