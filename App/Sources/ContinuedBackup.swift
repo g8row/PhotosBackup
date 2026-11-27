@@ -26,8 +26,9 @@ enum ContinuedBackupPolicy {
     /// account or a new iOS window does not.
     static func shouldContinue(hasWorkableItems: Bool, userPaused: Bool, halted: Bool,
                                networkPaused: Bool, systemPaused: Bool,
-                               powerPaused: Bool = false) -> Bool {
-        hasWorkableItems && !userPaused && !halted && !networkPaused && !systemPaused && !powerPaused
+                               powerPaused: Bool = false,
+                               dailyLimitPaused: Bool = false) -> Bool {
+        hasWorkableItems && !userPaused && !halted && !networkPaused && !systemPaused && !powerPaused && !dailyLimitPaused
     }
 
     /// The identifier prefixes to submit under, best first. iOS wants the

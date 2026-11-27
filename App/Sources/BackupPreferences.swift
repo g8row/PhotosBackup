@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UniformTypeIdentifiers
 
 enum BackupConnection: String, CaseIterable, Identifiable {
     case wifiOnly
@@ -22,6 +23,39 @@ enum BackupConnection: String, CaseIterable, Identifiable {
     }
 }
 
+/// Which media types selected-album and folder scans include (issue #32).
+enum BackupMediaFilter: String, CaseIterable, Identifiable, Sendable {
+    case all
+    case photosOnly
+    case videosOnly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "Photos & Videos"
+        case .photosOnly: return "Photos Only"
+        case .videosOnly: return "Videos Only"
+        }
+    }
+
+    func matches(_ mediaType: PHAssetMediaType) -> Bool {
+        switch self {
+        case .all: return mediaType == .image || mediaType == .video
+        case .photosOnly: return mediaType == .image
+        case .videosOnly: return mediaType == .video
+        }
+    }
+
+    func matches(utType: UTType) -> Bool {
+        switch self {
+        case .all: return utType.conforms(to: .image) || utType.conforms(to: .movie)
+        case .photosOnly: return utType.conforms(to: .image)
+        case .videosOnly: return utType.conforms(to: .movie)
+        }
+    }
+}
+
 @MainActor
 final class BackupPreferences: ObservableObject {
     private enum Key {
@@ -33,12 +67,17 @@ final class BackupPreferences: ObservableObject {
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
         static let backUpLivePhotoMotion = "backup.livePhotoMotion"
+        static let backUpEditedPhotoOriginals = "backup.editedPhotoOriginals"
         static let keepAliveEnabled = "backup.keepAlive.enabled"
         static let keepAliveMode = "backup.keepAlive.mode"
         static let albumsFromLibrary = "backup.albumsFromLibrary"
         static let onlyWhileCharging = "backup.onlyWhileCharging"
         static let minimumBatteryPercent = "backup.minimumBatteryPercent"
         static let significantLocationWake = "backup.significantLocationWake"
+        static let mediaFilter = "backup.mediaFilter"
+        static let backupFromDateEnabled = "backup.fromDateEnabled"
+        static let backupFromDate = "backup.fromDate"
+        static let dailyUploadLimitBytes = "backup.dailyUploadLimitBytes"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -49,6 +88,9 @@ final class BackupPreferences: ObservableObject {
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
     @Published var backUpLivePhotoMotion: Bool { didSet { defaults.set(backUpLivePhotoMotion, forKey: Key.backUpLivePhotoMotion) } }
+    /// Opt-in upload of the unedited `.photo` resource alongside the rendered
+    /// edit for edited photos (issue #33).
+    @Published var backUpEditedPhotoOriginals: Bool { didSet { defaults.set(backUpEditedPhotoOriginals, forKey: Key.backUpEditedPhotoOriginals) } }
     /// Keep the app running in the background while work is queued. See
     /// `BackgroundKeepAlive`.
     @Published var keepAliveEnabled: Bool { didSet { defaults.set(keepAliveEnabled, forKey: Key.keepAliveEnabled) } }
@@ -63,6 +105,19 @@ final class BackupPreferences: ObservableObject {
     /// Opt-in significant-location-change wake (arrival home / travel) for
     /// unattended photo discovery; requires Always location permission.
     @Published var significantLocationWake: Bool { didSet { defaults.set(significantLocationWake, forKey: Key.significantLocationWake) } }
+    /// Restrict selected-album and folder backups to photos, videos, or both (issue #32).
+    @Published var mediaFilter: BackupMediaFilter { didSet { defaults.set(mediaFilter.rawValue, forKey: Key.mediaFilter) } }
+    /// When on, only items created on or after `backupFromDate` are included in scans (issue #23).
+    @Published var backupFromDateEnabled: Bool { didSet { defaults.set(backupFromDateEnabled, forKey: Key.backupFromDateEnabled) } }
+    @Published var backupFromDate: Date { didSet { defaults.set(backupFromDate.timeIntervalSince1970, forKey: Key.backupFromDate) } }
+    /// Maximum bytes to upload per local calendar day (`0` = unlimited, issue #14).
+    @Published var dailyUploadLimitBytes: Int64 { didSet { defaults.set(max(0, dailyUploadLimitBytes), forKey: Key.dailyUploadLimitBytes) } }
+
+    /// Active cutoff date when `backupFromDateEnabled` is on, or `nil`.
+    var backupCutoffDate: Date? { backupFromDateEnabled ? backupFromDate : nil }
+
+    /// True when either the media type filter or the cutoff date narrows the library.
+    var hasActiveScanFilter: Bool { mediaFilter != .all || backupFromDateEnabled }
 
     private let defaults: UserDefaults
 
@@ -82,6 +137,9 @@ final class BackupPreferences: ObservableObject {
         // motion attached. An update uploads the motion of every Live Photo
         // already backed up, a few MB each.
         backUpLivePhotoMotion = defaults.object(forKey: Key.backUpLivePhotoMotion) as? Bool ?? true
+        // Off until asked for: uploading an extra copy of every edited photo
+        // adds visible duplicates in Google Photos for users who don't want them.
+        backUpEditedPhotoOriginals = defaults.bool(forKey: Key.backUpEditedPhotoOriginals)
         // On unless turned off: without it iOS suspends the app seconds after
         // it leaves the foreground, which is the most reported problem. Silent
         // audio needs no permission, and it stops once the queue cannot move.
@@ -93,6 +151,18 @@ final class BackupPreferences: ObservableObject {
         onlyWhileCharging = defaults.bool(forKey: Key.onlyWhileCharging)
         minimumBatteryPercent = max(0, min(100, defaults.integer(forKey: Key.minimumBatteryPercent)))
         significantLocationWake = defaults.bool(forKey: Key.significantLocationWake)
+        mediaFilter = BackupMediaFilter(rawValue: defaults.string(forKey: Key.mediaFilter) ?? "") ?? .all
+        backupFromDateEnabled = defaults.bool(forKey: Key.backupFromDateEnabled)
+        if let savedTimestamp = defaults.object(forKey: Key.backupFromDate) as? Double {
+            backupFromDate = Date(timeIntervalSince1970: savedTimestamp)
+        } else {
+            backupFromDate = Date()
+        }
+        if let stored = defaults.object(forKey: Key.dailyUploadLimitBytes) as? NSNumber {
+            dailyUploadLimitBytes = max(0, stored.int64Value)
+        } else {
+            dailyUploadLimitBytes = 0
+        }
     }
 
     func toggle(albumID: String) {
@@ -133,6 +203,9 @@ final class PhotoAlbumStore: ObservableObject {
     @Published private(set) var isLoading = false
     /// Backed-up item counts per album id, filled in lazily off the main actor.
     @Published private(set) var backedUpCounts: [String: Int] = [:]
+    /// Total matching item counts per selected album id under the active
+    /// media filter and cutoff date, paired with `backedUpCounts`.
+    @Published private(set) var eligibleCounts: [String: Int] = [:]
 
     private var refreshTask: Task<Void, Never>?
     private var countsTask: Task<Void, Never>?
@@ -223,16 +296,22 @@ final class PhotoAlbumStore: ObservableObject {
         return ordered
     }
 
-    /// Asset identifiers per album, enumerated off the main actor.
-    func assetIdentifiers(for albumIDs: Set<String>) async -> [String: [String]] {
+    /// Asset identifiers per album matching `mediaFilter` and `cutoffDate`,
+    /// enumerated off the main actor.
+    func assetIdentifiers(
+        for albumIDs: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) async -> [String: [String]] {
         let targets = albums.filter { albumIDs.contains($0.id) }
             .map { ($0.id, $0.collection) }
         guard !targets.isEmpty else { return [:] }
         return await Task.detached(priority: .userInitiated) {
             var result: [String: [String]] = [:]
             for (id, collection) in targets {
-                let assets = collection.map { PHAsset.fetchAssets(in: $0, options: .includingBurstFrames) }
-                    ?? PHAsset.fetchAssets(with: Self.allPhotosOptions())
+                let assets = collection.map {
+                    PHAsset.fetchAssets(in: $0, options: Self.fetchOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate))
+                } ?? PHAsset.fetchAssets(with: Self.allPhotosOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate))
                 var identifiers: [String] = []
                 identifiers.reserveCapacity(assets.count)
                 assets.enumerateObjects { asset, _, _ in identifiers.append(asset.localIdentifier) }
@@ -242,10 +321,14 @@ final class PhotoAlbumStore: ObservableObject {
         }.value
     }
 
-    func sources(for albumIDs: Set<String>) async -> [MediaSource] {
+    func sources(
+        for albumIDs: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) async -> [MediaSource] {
         // Albums overlap (and "All Photos" contains all of them), so dedup by
         // asset identifier — otherwise one asset becomes several queue sources.
-        let byAlbum = await assetIdentifiers(for: albumIDs)
+        let byAlbum = await assetIdentifiers(for: albumIDs, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
         var seen = Set<String>()
         var sources: [MediaSource] = []
         for album in albums where albumIDs.contains(album.id) {
@@ -261,16 +344,21 @@ final class PhotoAlbumStore: ObservableObject {
         albums.filter { albumIDs.contains($0.id) }.map { ($0.id, $0.collection) }
     }
 
-    /// Enumerate every selected album off the main actor.
-    nonisolated static func sources(for targets: [(id: String, collection: PHAssetCollection?)]) -> [MediaSource] {
+    /// Enumerate every selected album off the main actor, filtered by media type
+    /// and optional creation-date cutoff.
+    nonisolated static func sources(
+        for targets: [(id: String, collection: PHAssetCollection?)],
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> [MediaSource] {
         var seen = Set<String>()
         var sources: [MediaSource] = []
         for (_, collection) in targets {
             let assets: PHFetchResult<PHAsset>
             if let collection {
-                assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
+                assets = PHAsset.fetchAssets(in: collection, options: fetchOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate))
             } else {
-                assets = PHAsset.fetchAssets(with: allPhotosOptions())
+                assets = PHAsset.fetchAssets(with: allPhotosOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate))
             }
             assets.enumerateObjects { asset, _, _ in
                 guard seen.insert(asset.localIdentifier).inserted else { return }
@@ -281,27 +369,33 @@ final class PhotoAlbumStore: ObservableObject {
     }
 
     /// Restrict a PhotoKit persistent-change batch to the selected albums off
-    /// the main actor.
+    /// the main actor, applying the active media type filter and cutoff date.
     nonisolated static func sources(
         for targets: [(id: String, collection: PHAssetCollection?)],
         selectedAlbumIDs: Set<String>,
-        matching identifiers: Set<String>
+        matching identifiers: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
     ) -> [MediaSource] {
         guard !identifiers.isEmpty else { return [] }
         if selectedAlbumIDs.contains(PhotoAlbum.allPhotosID) {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: .includingBurstFrames)
+            let assets = PHAsset.fetchAssets(
+                withLocalIdentifiers: Array(identifiers),
+                options: fetchOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate)
+            )
             var result: [MediaSource] = []
             assets.enumerateObjects { asset, _, _ in
-                guard asset.mediaType == .image || asset.mediaType == .video else { return }
+                guard matchesFilter(asset, mediaFilter: mediaFilter, cutoffDate: cutoffDate) else { return }
                 result.append(.asset(localIdentifier: asset.localIdentifier))
             }
             return result
         }
 
         var matched = Set<String>()
+        let options = fetchOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate)
         for (_, collection) in targets {
             guard let collection else { continue }
-            let assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
+            let assets = PHAsset.fetchAssets(in: collection, options: options)
             assets.enumerateObjects { asset, _, stop in
                 if identifiers.contains(asset.localIdentifier) { matched.insert(asset.localIdentifier) }
                 if matched.count == identifiers.count { stop.pointee = true }
@@ -311,16 +405,25 @@ final class PhotoAlbumStore: ObservableObject {
     }
 
     /// Synchronous variant, retained for callers already on a background thread.
-    func sourcesSynchronously(for albumIDs: Set<String>) -> [MediaSource] {
-        Self.sources(for: scanTargets(for: albumIDs))
+    func sourcesSynchronously(
+        for albumIDs: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> [MediaSource] {
+        Self.sources(for: scanTargets(for: albumIDs), mediaFilter: mediaFilter, cutoffDate: cutoffDate)
     }
 
-    /// Recompute "N of M backed up" for the selected albums. `isBackedUp` is
-    /// resolved against the queue's durable completion ledger.
-    func refreshBackedUpCounts(for albumIDs: Set<String>,
-                               isBackedUp: @escaping @Sendable (String) -> Bool) {
+    /// Recompute "N of M backed up" for the selected albums under the active
+    /// filter settings. `isBackedUp` is resolved against the queue's durable
+    /// completion ledger.
+    func refreshBackedUpCounts(
+        for albumIDs: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil,
+        isBackedUp: @escaping @Sendable (String) -> Bool
+    ) {
         countsTask?.cancel()
-        guard canRead, !albumIDs.isEmpty else { backedUpCounts = [:]; return }
+        guard canRead, !albumIDs.isEmpty else { backedUpCounts = [:]; eligibleCounts = [:]; return }
         countsTask = Task { @MainActor [weak self] in
             guard let self else { return }
             // Leading edge, then at most one pass per interval: the first call
@@ -332,57 +435,98 @@ final class PhotoAlbumStore: ObservableObject {
                 guard !Task.isCancelled else { return }
             }
             self.lastCountsRefreshStartedAt = Date()
-            let byAlbum = await self.assetIdentifiers(for: albumIDs)
+            let byAlbum = await self.assetIdentifiers(for: albumIDs, mediaFilter: mediaFilter, cutoffDate: cutoffDate)
             guard !Task.isCancelled else { return }
-            let counts = await Task.detached(priority: .utility) {
-                byAlbum.mapValues { identifiers in
+            let (counts, totals) = await Task.detached(priority: .utility) {
+                let backedUp = byAlbum.mapValues { identifiers in
                     identifiers.reduce(into: 0) { total, id in
                         if isBackedUp(id) { total += 1 }
                     }
                 }
+                let eligible = byAlbum.mapValues(\.count)
+                return (backedUp, eligible)
             }.value
             guard !Task.isCancelled else { return }
             self.backedUpCounts = counts
+            self.eligibleCounts = totals
         }
     }
 
     /// Restrict a PhotoKit persistent-change batch to the selected albums.
     /// The changed identifier set is normally tiny, while the full-scan method
     /// above remains the iOS 15 and expired-token fallback.
-    func sources(for albumIDs: Set<String>, matching identifiers: Set<String>) -> [MediaSource] {
-        guard !identifiers.isEmpty else { return [] }
-        if albumIDs.contains(PhotoAlbum.allPhotosID) {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: .includingBurstFrames)
-            var result: [MediaSource] = []
-            assets.enumerateObjects { asset, _, _ in
-                guard asset.mediaType == .image || asset.mediaType == .video else { return }
-                result.append(.asset(localIdentifier: asset.localIdentifier))
-            }
-            return result
-        }
+    func sources(
+        for albumIDs: Set<String>,
+        matching identifiers: Set<String>,
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> [MediaSource] {
+        Self.sources(
+            for: scanTargets(for: albumIDs),
+            selectedAlbumIDs: albumIDs,
+            matching: identifiers,
+            mediaFilter: mediaFilter,
+            cutoffDate: cutoffDate
+        )
+    }
 
-        var matched = Set<String>()
-        for album in albums where albumIDs.contains(album.id) {
-            guard let collection = album.collection else { continue }
-            let assets = PHAsset.fetchAssets(in: collection, options: .includingBurstFrames)
-            assets.enumerateObjects { asset, _, stop in
-                if identifiers.contains(asset.localIdentifier) { matched.insert(asset.localIdentifier) }
-                if matched.count == identifiers.count { stop.pointee = true }
-            }
+    nonisolated static func matchesFilter(
+        _ asset: PHAsset,
+        mediaFilter: BackupMediaFilter,
+        cutoffDate: Date?
+    ) -> Bool {
+        guard mediaFilter.matches(asset.mediaType) else { return false }
+        if let cutoffDate {
+            guard let created = asset.creationDate, created >= cutoffDate else { return false }
         }
-        return matched.map { .asset(localIdentifier: $0) }
+        return true
+    }
+
+    nonisolated static func assetPredicate(
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> NSPredicate {
+        let mediaPredicate: NSPredicate
+        switch mediaFilter {
+        case .all:
+            mediaPredicate = NSPredicate(
+                format: "mediaType == %d OR mediaType == %d",
+                PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
+            )
+        case .photosOnly:
+            mediaPredicate = NSPredicate(
+                format: "mediaType == %d",
+                PHAssetMediaType.image.rawValue
+            )
+        case .videosOnly:
+            mediaPredicate = NSPredicate(
+                format: "mediaType == %d",
+                PHAssetMediaType.video.rawValue
+            )
+        }
+        guard let cutoffDate else { return mediaPredicate }
+        let datePredicate = NSPredicate(format: "creationDate >= %@", cutoffDate as NSDate)
+        return NSCompoundPredicate(andPredicateWithSubpredicates: [mediaPredicate, datePredicate])
+    }
+
+    nonisolated static func fetchOptions(
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> PHFetchOptions {
+        let options = PHFetchOptions()
+        options.predicate = assetPredicate(mediaFilter: mediaFilter, cutoffDate: cutoffDate)
+        options.includeAllBurstAssets = true
+        return options
     }
 
     /// Images and videos across the whole library, newest first, for the
     /// synthetic "All Photos" album.
-    nonisolated static func allPhotosOptions() -> PHFetchOptions {
-        let options = PHFetchOptions()
-        options.predicate = NSPredicate(
-            format: "mediaType == %d OR mediaType == %d",
-            PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
-        )
+    nonisolated static func allPhotosOptions(
+        mediaFilter: BackupMediaFilter = .all,
+        cutoffDate: Date? = nil
+    ) -> PHFetchOptions {
+        let options = fetchOptions(mediaFilter: mediaFilter, cutoffDate: cutoffDate)
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.includeAllBurstAssets = true
         return options
     }
 

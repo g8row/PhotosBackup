@@ -115,16 +115,19 @@ enum FolderScanner {
         return String(name.dropFirst().dropLast(".icloud".count))
     }
 
-    /// Whether a filename is a photo or video, judged by its extension.
-    static func isMedia(_ name: String) -> Bool {
+    /// Whether a filename is a photo or video matching `filter`, judged by its extension.
+    static func isMedia(_ name: String, filter: BackupMediaFilter = .all) -> Bool {
         guard let type = UTType(filenameExtension: (name as NSString).pathExtension) else { return false }
-        return type.conforms(to: .image) || type.conforms(to: .movie)
+        return filter.matches(utType: type)
     }
 
     /// Register a folder from the picker and list every photo and video under
-    /// it, in path order. Blocking file-system work: call it off the main actor.
+    /// it matching `mediaFilter` and `cutoffDate`, in path order. Blocking
+    /// file-system work: call it off the main actor.
     static func sources(inPickedFolder folderURL: URL,
-                        store: PickedFolderStore = .shared) throws -> [MediaSource] {
+                        store: PickedFolderStore = .shared,
+                        mediaFilter: BackupMediaFilter = .all,
+                        cutoffDate: Date? = nil) throws -> [MediaSource] {
         let accessing = folderURL.startAccessingSecurityScopedResource()
         defer { if accessing { folderURL.stopAccessingSecurityScopedResource() } }
         let folderID = try store.register(folderURL)
@@ -133,7 +136,8 @@ enum FolderScanner {
         guard let enumerator = FileManager.default.enumerator(atPath: folderURL.path) else { return [] }
         var paths: [String] = []
         while let relative = enumerator.nextObject() as? String {
-            let isDirectory = enumerator.fileAttributes?[.type] as? FileAttributeType == .typeDirectory
+            let attributes = enumerator.fileAttributes
+            let isDirectory = attributes?[.type] as? FileAttributeType == .typeDirectory
             var name = (relative as NSString).lastPathComponent
             if name.hasPrefix(".") {
                 // Skip hidden folders outright; keep only iCloud placeholders.
@@ -143,7 +147,12 @@ enum FolderScanner {
             } else if isDirectory {
                 continue
             }
-            guard isMedia(name) else { continue }
+            guard isMedia(name, filter: mediaFilter) else { continue }
+            if let cutoffDate,
+               let modified = attributes?[.modificationDate] as? Date,
+               modified < cutoffDate {
+                continue
+            }
             let directory = (relative as NSString).deletingLastPathComponent
             paths.append(directory.isEmpty ? name : directory + "/" + name)
         }

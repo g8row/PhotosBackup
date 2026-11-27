@@ -11,11 +11,11 @@ enum PersistedMediaSource: Codable, Equatable, Sendable {
 
     init?(_ source: MediaSource) {
         switch source {
-        // Motion, edit-base and video-original rows are stored as their asset plus a flag on
-        // `PersistedUploadItem`, so a snapshot stays readable by builds that
-        // predate them.
+        // Motion, edit-base, video-original and photo-original rows are stored as
+        // their asset plus a flag on `PersistedUploadItem`, so a snapshot stays
+        // readable by builds that predate them.
         case .asset(let identifier), .livePhotoMotion(let identifier), .editBase(let identifier),
-             .videoOriginal(let identifier):
+             .videoOriginal(let identifier), .photoOriginal(let identifier):
             self = .asset(identifier)
         case .file(let url): self = .file(url.standardizedFileURL.path)
         case .folderFile(let folderID, let relativePath): self = .folderFile(folderID: folderID, relativePath: relativePath)
@@ -78,6 +78,8 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
     let editBase: Bool?
     /// True for an edited video's original row, stored the same way.
     let videoOriginal: Bool?
+    /// True for an edited photo's unedited original row (issue #33).
+    let photoOriginal: Bool?
     /// True for a row the user asked to upload again. Nil otherwise.
     let forceUpload: Bool?
 
@@ -85,7 +87,7 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
          attempts: Int, failureReason: String?, failureRetryable: Bool,
          checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil,
          interruptedPreparations: Int? = nil, motion: Bool? = nil, editBase: Bool? = nil,
-         videoOriginal: Bool? = nil, forceUpload: Bool? = nil) {
+         videoOriginal: Bool? = nil, photoOriginal: Bool? = nil, forceUpload: Bool? = nil) {
         self.id = id
         self.source = source
         self.name = name
@@ -99,6 +101,7 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
         self.motion = motion
         self.editBase = editBase
         self.videoOriginal = videoOriginal
+        self.photoOriginal = photoOriginal
         self.forceUpload = forceUpload
     }
 
@@ -107,6 +110,7 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
             if motion == true { return .livePhotoMotion(localIdentifier: identifier) }
             if editBase == true { return .editBase(localIdentifier: identifier) }
             if videoOriginal == true { return .videoOriginal(localIdentifier: identifier) }
+            if photoOriginal == true { return .photoOriginal(localIdentifier: identifier) }
         }
         return source.mediaSource
     }

@@ -11,6 +11,8 @@ struct FolderSelectionView: View {
 
     private func refreshBackedUpCounts() {
         albums.refreshBackedUpCounts(for: preferences.selectedAlbumIDs,
+                                     mediaFilter: preferences.mediaFilter,
+                                     cutoffDate: preferences.backupCutoffDate,
                                      isBackedUp: queue.backedUpAssetLookup())
     }
 
@@ -48,6 +50,11 @@ struct FolderSelectionView: View {
                 refreshBackedUpCounts()
             }
             .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.mediaFilter) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.backupFromDateEnabled) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.backupFromDate) { _ in
+                if preferences.backupFromDateEnabled { refreshBackedUpCounts() }
+            }
             .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
             // The completion ledger, not the rows: `items` changes on every
             // progress tick, and each of those kicked off a fresh enumeration of
@@ -76,7 +83,8 @@ struct FolderSelectionView: View {
                 ForEach(filteredAlbums) { album in
                     AlbumSelectionRow(album: album,
                                       isSelected: preferences.selectedAlbumIDs.contains(album.id),
-                                      backedUpCount: albums.backedUpCounts[album.id]) {
+                                      backedUpCount: albums.backedUpCounts[album.id],
+                                      eligibleCount: albums.eligibleCounts[album.id]) {
                         preferences.toggle(albumID: album.id)
                     }
                 }

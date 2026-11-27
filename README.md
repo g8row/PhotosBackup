@@ -36,7 +36,12 @@ without a desktop companion or hosted service.
 - Re-upload the selected albums on request, including items already in Google
   Photos, under the current Storage Saver and storage quota settings.
 - Back up an edited photo as it looks on the iPhone, the file the Google Photos
-  app would upload itself, so Google Photos' Free up space recognises it.
+  app would upload itself, so Google Photos' Free up space recognises it, and
+  optionally also back up its unedited original (**Settings → Backup → Back Up
+  Edited Photo Originals**).
+- Filter backups by **Media Types** (Photos & Videos, Photos Only, or Videos
+  Only) and optionally set an **Only Back Up After Date** cutoff (**Settings →
+  Backup**).
 - Back up every frame of a burst, including frames Photos hides inside the
   burst, so the Google Photos app counts bursts as backed up.
 - Back up an edited video's original as well as its edit, including Cinematic
@@ -53,8 +58,9 @@ without a desktop companion or hosted service.
 - Choose how many uploads run at once, from 1 to 10.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
   cancelling in-flight background transfers when the allowed transport is lost.
-- Optionally limit backups to **Only While Charging** or above a **Minimum
-  Battery** percentage (**Settings → Backup**).
+- Optionally limit backups to **Only While Charging**, above a **Minimum
+  Battery** percentage, or up to a **Daily Upload Limit** (500 MB – 10 GB per
+  day, counting only bytes uploaded) (**Settings → Backup**).
 - Export and import backup history (completion ledger and Google album links,
   without credentials or media) in **Settings → Storage**, so reinstalling or
   switching signing certificates does not require re-checking the whole library.
@@ -101,8 +107,8 @@ The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
 Latest release: **0.4.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-Every push and pull request runs the suite on an iPhone simulator: 236 tests,
-234 pass, 0 fail. The 2 opt-in live tests are skipped.
+Every push and pull request runs the suite on an iPhone simulator: 245 tests,
+243 pass, 0 fail. The 2 opt-in live tests are skipped.
 
 Each release's `.ipa` is built by GitHub Actions from the tagged commit and
 attached with its SHA-256, so the binary can be checked against the source it
@@ -290,8 +296,9 @@ Android master token → Photos access token → private Photos API
   though the library already holds it: an upload of the same bytes merges into
   that existing item. Any edit in Apple Photos makes a new file, which then
   counts once backed up.
-- An edited photo or video is backed up as it looks on the iPhone. Its
-  unedited original is kept only if an earlier backup uploaded it.
+- An edited photo or video is backed up as it looks on the iPhone. Turn on
+  **Back Up Edited Photo Originals** in Settings if you also want the unedited
+  original of edited photos uploaded alongside the edit.
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
 - Continuing after you leave the app needs iOS 26, and iOS accepts the request

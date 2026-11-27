@@ -429,6 +429,7 @@ struct AlbumSelectionRow: View {
     let album: PhotoAlbum
     let isSelected: Bool
     var backedUpCount: Int? = nil
+    var eligibleCount: Int? = nil
     let action: () -> Void
 
     var body: some View {
@@ -450,8 +451,10 @@ struct AlbumSelectionRow: View {
     }
 
     private var detail: String {
-        guard let backedUpCount else { return "\(album.count.formatted()) items" }
-        if backedUpCount >= album.count, album.count > 0 { return "All \(album.count.formatted()) backed up" }
-        return "\(backedUpCount.formatted()) of \(album.count.formatted()) backed up"
+        let total = eligibleCount ?? album.count
+        guard let backedUpCount else { return "\(total.formatted()) items" }
+        if total == 0 { return "0 matching items" }
+        if backedUpCount >= total { return "All \(total.formatted()) backed up" }
+        return "\(backedUpCount.formatted()) of \(total.formatted()) backed up"
     }
 }

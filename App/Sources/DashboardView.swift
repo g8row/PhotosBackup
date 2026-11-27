@@ -22,12 +22,16 @@ struct DashboardView: View {
         albums.albums.filter { preferences.selectedAlbumIDs.contains($0.id) }
     }
 
+    private func eligibleCount(for album: PhotoAlbum) -> Int {
+        albums.eligibleCounts[album.id] ?? album.count
+    }
+
     /// Unique-item estimate for the selection. "All Photos" spans the whole
     /// image/video library, so when it is selected every other album is a
     /// subset of it — summing per-album counts would count most assets twice.
     private var selectedItemCount: Int {
-        if let all = selectedAlbums.first(where: { $0.isAllPhotos }) { return all.count }
-        return selectedAlbums.reduce(0) { $0 + $1.count }
+        if let all = selectedAlbums.first(where: { $0.isAllPhotos }) { return eligibleCount(for: all) }
+        return selectedAlbums.reduce(0) { $0 + eligibleCount(for: $1) }
     }
 
     var body: some View {
@@ -71,6 +75,11 @@ struct DashboardView: View {
                 refreshBackedUpCounts()
             }
             .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.mediaFilter) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.backupFromDateEnabled) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.backupFromDate) { _ in
+                if preferences.backupFromDateEnabled { refreshBackedUpCounts() }
+            }
             .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
             .onChange(of: queue.completedSourceKeys) { _ in refreshBackedUpCounts() }
         }
@@ -261,20 +270,26 @@ struct DashboardView: View {
         Task {
             defer { isScanningFolder = false }
             do {
+                let mediaFilter = preferences.mediaFilter
+                let cutoffDate = preferences.backupCutoffDate
                 let sources = try await Task.detached(priority: .userInitiated) {
-                    try FolderScanner.sources(inPickedFolder: folderURL)
+                    try FolderScanner.sources(
+                        inPickedFolder: folderURL,
+                        mediaFilter: mediaFilter,
+                        cutoffDate: cutoffDate
+                    )
                 }.value
                 let queued = queue.enqueue(sources, skippingExisting: true).count
                 if queued > 0 { automaticBackup.refreshBackgroundContinuation() }
                 // Counts only: folder and file names stay out of the log.
                 DiagnosticEventLog.shared.record(
-                    "queue", "Scanned a picked folder: \(sources.count) photos and videos, \(queued) newly queued")
+                    "queue", "Scanned a picked folder: \(sources.count) matching items, \(queued) newly queued")
                 let name = folderURL.lastPathComponent
                 manualRunMessage = sources.isEmpty
-                    ? "No photos or videos found in “\(name)”."
+                    ? "No matching photos or videos found in “\(name)”."
                     : queued == 0
-                        ? "Everything in “\(name)” is already backed up or queued."
-                        : "Backing up \(queued.formatted()) items from “\(name)”. Watch progress in Activity."
+                        ? "Everything matching in “\(name)” is already backed up or queued."
+                        : "Checking and backing up \(queued.formatted()) items from “\(name)”. Watch progress in Activity."
             } catch {
                 manualRunMessage = "Could not read that folder: \(error.localizedDescription)"
             }
@@ -309,9 +324,9 @@ struct DashboardView: View {
                             Text(progressLabel(for: album)).font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Image(systemName: albums.backedUpCounts[album.id] == album.count
+                        Image(systemName: albums.backedUpCounts[album.id] == eligibleCount(for: album)
                               ? "checkmark.circle.fill" : "circle.dashed")
-                            .foregroundStyle(albums.backedUpCounts[album.id] == album.count
+                            .foregroundStyle(albums.backedUpCounts[album.id] == eligibleCount(for: album)
                                              ? Color.green : BackupTheme.blue)
                     }
                 }
@@ -428,14 +443,20 @@ struct DashboardView: View {
     }
 
     private func progressLabel(for album: PhotoAlbum) -> String {
+        let total = eligibleCount(for: album)
         guard let backedUp = albums.backedUpCounts[album.id] else {
-            return "\(album.count.formatted()) items"
+            return "\(total.formatted()) items"
         }
-        return "\(backedUp.formatted()) of \(album.count.formatted()) backed up"
+        if total == 0, preferences.hasActiveScanFilter {
+            return "0 matching items"
+        }
+        return "\(backedUp.formatted()) of \(total.formatted()) backed up"
     }
 
     private func refreshBackedUpCounts() {
         albums.refreshBackedUpCounts(for: preferences.selectedAlbumIDs,
+                                     mediaFilter: preferences.mediaFilter,
+                                     cutoffDate: preferences.backupCutoffDate,
                                      isBackedUp: queue.backedUpAssetLookup())
     }
 
@@ -455,7 +476,7 @@ struct DashboardView: View {
         case .noLibraryAccess: return "Allow photo access in Settings to back up your albums."
         case .noAlbumsSelected: return "Choose albums in the Albums tab first."
         case .nothingToDo: return "Everything in your selected albums is already backed up."
-        case .started(let count): return "Backing up \(count.formatted()) items. Watch progress in Activity."
+        case .started(let count): return "Checking and backing up \(count.formatted()) items. Watch progress in Activity."
         case .rechecking(let count): return "Re-checking \(count.formatted()) items against Google Photos."
         case .reuploading(let count): return "Uploading \(count.formatted()) items again. Watch progress in Activity."
         }

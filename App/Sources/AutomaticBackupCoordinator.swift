@@ -86,6 +86,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private let albums: PhotoAlbumStore
     private let network: NetworkPolicyMonitor
     private let power: PowerPolicyMonitor
+    let dailyBudget: DailyUploadTracker
     private let libraryChanges: PhotoLibraryChangeTracker
 
     private var registered = false
@@ -143,6 +144,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
          albums: PhotoAlbumStore,
          network: NetworkPolicyMonitor,
          power: PowerPolicyMonitor? = nil,
+         dailyBudget: DailyUploadTracker? = nil,
          libraryChanges: PhotoLibraryChangeTracker? = nil) {
         self.photos = photos
         self.account = account
@@ -151,9 +153,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
         self.albums = albums
         self.network = network
         self.power = power ?? PowerPolicyMonitor()
+        self.dailyBudget = dailyBudget ?? DailyUploadTracker()
         self.libraryChanges = libraryChanges ?? PhotoLibraryChangeTracker()
         queue.followUpSources = { [weak self] source in
             self?.followUps(after: source) ?? []
+        }
+        queue.onBytesUploaded = { [weak self] bytes in
+            self?.recordUploadedBytes(bytes)
         }
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) { setUpContinuedBackup() }
@@ -228,9 +234,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
         await queueEditedVersionsOnce()
         await queueEditBasesOnce()
         await queueVideoOriginals()
+        await queuePhotoOriginals()
         await queueLivePhotoMotion()
         applyNetworkPolicy()
         applyPowerPolicy()
+        applyDailyLimitPolicy()
         updateSchedule()
         updateSignificantLocationWake()
         runForegroundBackupIfNeeded()
@@ -257,6 +265,15 @@ final class AutomaticBackupCoordinator: ObservableObject {
         applyPowerPolicy()
         updateSchedule()
         runForegroundBackupIfNeeded()
+    }
+
+    func dailyUploadLimitDidChange() {
+        applyDailyLimitPolicy()
+        runForegroundBackupIfNeeded()
+    }
+
+    func editedPhotoOriginalsPreferenceDidChange() {
+        Task { await queuePhotoOriginals() }
     }
 
     func significantLocationWakePreferenceDidChange() {
@@ -290,6 +307,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
             await queueEditedVersionsOnce()
             await queueEditBasesOnce()
             await queueVideoOriginals()
+            await queuePhotoOriginals()
             await queueLivePhotoMotion()
         }
     }
@@ -322,6 +340,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         if MediaExporter.hasVideoOriginal(asset) {
             followUps.append(.videoOriginal(localIdentifier: identifier))
+        }
+        if preferences.backUpEditedPhotoOriginals, MediaExporter.hasPhotoOriginal(asset) {
+            followUps.append(.photoOriginal(localIdentifier: identifier))
         }
         return followUps
     }
@@ -382,6 +403,37 @@ final class AutomaticBackupCoordinator: ObservableObject {
             "queue",
             "Queued the original of \(queued) of \(originals.count) edited videos, from \(read) of \(identifiers.count) library items read; the Google Photos app checks it before it counts them as backed up"
         )
+    }
+
+    /// Queue the unedited original of every edited photo remembered as backed up
+    /// whose original is not recorded yet, when the user opts in (issue #33).
+    func queuePhotoOriginals() async {
+        guard preferences.backUpEditedPhotoOriginals, let email = account.status.email,
+              MediaLibrary.isReadable, queue.persistenceWarning == nil else { return }
+        let completed = queue.completedSourceKeys
+        let identifiers = completed.compactMap { key -> String? in
+            guard key.hasPrefix("asset:") else { return nil }
+            let identifier = String(key.dropFirst("asset:".count))
+            return completed.contains(UploadQueue.photoOriginalKeyPrefix + identifier) ? nil : identifier
+        }
+        guard !identifiers.isEmpty else { return }
+        let originals = await Task.detached(priority: .utility) { () -> [MediaSource] in
+            var found: [MediaSource] = []
+            PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: .includingBurstFrames).enumerateObjects { asset, _, _ in
+                if MediaExporter.hasPhotoOriginal(asset) {
+                    found.append(.photoOriginal(localIdentifier: asset.localIdentifier))
+                }
+            }
+            return found
+        }.value
+        guard account.status.email == email, preferences.backUpEditedPhotoOriginals, !originals.isEmpty else { return }
+        let queued = queue.enqueue(originals, skippingExisting: true).count
+        if queued > 0 {
+            DiagnosticEventLog.shared.record(
+                "queue",
+                "Queued the unedited original of \(queued) edited photo\(queued == 1 ? "" : "s")"
+            )
+        }
     }
 
     /// Queue the motion of every Live Photo remembered as backed up whose motion
@@ -489,6 +541,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         queue.setPreparationGuardArmed(true)
         queue.setICloudDownloadsAllowed(true)
         queue.resumeSystemWork()
+        applyDailyLimitPolicy()
         if shouldRunAfterActivation {
             shouldRunAfterActivation = false
             ranForegroundBackup = false
@@ -515,6 +568,20 @@ final class AutomaticBackupCoordinator: ObservableObject {
             status: power.status
         )
         queue.setPowerAccess(allowed: decision.allowsUploads, pauseReason: decision.pauseReason)
+    }
+
+    func applyDailyLimitPolicy(now: Date = Date()) {
+        dailyBudget.refreshDay(now: now)
+        let decision = DailyUploadBudget.decision(
+            limitBytes: preferences.dailyUploadLimitBytes,
+            usedTodayBytes: dailyBudget.usedTodayBytes
+        )
+        queue.setDailyLimitAccess(allowed: decision.allowsUploads, pauseReason: decision.pauseReason)
+    }
+
+    private func recordUploadedBytes(_ bytes: Int64) {
+        dailyBudget.recordUploaded(bytes: bytes)
+        applyDailyLimitPolicy()
     }
 
     func updateSchedule() {
@@ -627,6 +694,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     }
 
     private func runForegroundBackupIfNeeded() {
+        dailyBudget.refreshDay()
         guard isForeground,
               !ranForegroundBackup,
               shouldSchedule,
@@ -635,7 +703,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
               preferences.connection.decision(for: network.status).allowsUploads,
               PowerPolicy.decision(onlyWhileCharging: preferences.onlyWhileCharging,
                                    minimumBatteryPercent: preferences.minimumBatteryPercent,
-                                   status: power.status).allowsUploads else { return }
+                                   status: power.status).allowsUploads,
+              DailyUploadBudget.decision(limitBytes: preferences.dailyUploadLimitBytes,
+                                         usedTodayBytes: dailyBudget.usedTodayBytes).allowsUploads else { return }
 
         ranForegroundBackup = true
         let runID = UUID()
@@ -646,7 +716,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
             let run = AutomaticBackupRunHistory.started(.foreground, context: self.executionContext())
             await self.albums.refresh()
             if self.albums.canRead, !Task.isCancelled {
-                let sources = await self.albums.sources(for: self.preferences.selectedAlbumIDs)
+                let sources = await self.albums.sources(
+                    for: self.preferences.selectedAlbumIDs,
+                    mediaFilter: self.preferences.mediaFilter,
+                    cutoffDate: self.preferences.backupCutoffDate
+                )
                 if !Task.isCancelled { await self.performForegroundBackup(sources) }
             } else {
                 // Access was refused or not decided yet. Release the once-per
@@ -713,7 +787,8 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// Any condition that stops the queue starting new work. Polling past one
     /// of these makes no progress and only keeps the main actor awake.
     private var isPausedForAnyReason: Bool {
-        queue.isUserPaused || queue.networkPauseReason != nil || queue.powerPauseReason != nil || queue.systemPauseReason != nil
+        queue.isUserPaused || queue.networkPauseReason != nil || queue.powerPauseReason != nil
+            || queue.dailyLimitPauseReason != nil || queue.systemPauseReason != nil
     }
 
     /// The result of a manual "Back Up Now" or "Re-check Backups", so the UI can
@@ -733,7 +808,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !preferences.selectedAlbumIDs.isEmpty else { return noteManual(.manual, .noAlbumsSelected) }
         await albums.refresh()
         guard albums.canRead else { return noteManual(.manual, .noLibraryAccess) }
-        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        let sources = await albums.sources(
+            for: preferences.selectedAlbumIDs,
+            mediaFilter: preferences.mediaFilter,
+            cutoffDate: preferences.backupCutoffDate
+        )
         // Released before the count is taken, not inside the run, so a retried
         // failure is part of the number the user is shown. A failed row already
         // tracks its source, so `enqueue` cannot count it a second time.
@@ -752,7 +831,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !preferences.selectedAlbumIDs.isEmpty else { return noteManual(.recheck, .noAlbumsSelected) }
         await albums.refresh()
         guard albums.canRead else { return noteManual(.recheck, .noLibraryAccess) }
-        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        let sources = await albums.sources(
+            for: preferences.selectedAlbumIDs,
+            mediaFilter: preferences.mediaFilter,
+            cutoffDate: preferences.backupCutoffDate
+        )
         guard !sources.isEmpty else { return noteManual(.recheck, .nothingToDo) }
         // A failed row is not in the completion ledger, so `reverify` cannot see
         // it — and as a tracked row it blocks its own source from being enqueued
@@ -773,7 +856,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard !preferences.selectedAlbumIDs.isEmpty else { return noteManual(.reupload, .noAlbumsSelected) }
         await albums.refresh()
         guard albums.canRead else { return noteManual(.reupload, .noLibraryAccess) }
-        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        let sources = await albums.sources(
+            for: preferences.selectedAlbumIDs,
+            mediaFilter: preferences.mediaFilter,
+            cutoffDate: preferences.backupCutoffDate
+        )
         guard !sources.isEmpty else { return noteManual(.reupload, .nothingToDo) }
         // Same reason as Re-check: a failed row would otherwise block its source.
         queue.retryRetryableFailures()
@@ -1139,6 +1226,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         applyNetworkPolicy()
         applyPowerPolicy()
+        applyDailyLimitPolicy()
 
         // A user pause is durable and must not be bypassed by a scheduled run.
         guard !queue.isUserPaused else {
@@ -1162,6 +1250,14 @@ final class AutomaticBackupCoordinator: ObservableObject {
             return finish(.init(success: true,
                                 summary: powerDecision.pauseReason ?? "Paused by battery settings"))
         }
+        let dailyDecision = DailyUploadBudget.decision(
+            limitBytes: preferences.dailyUploadLimitBytes,
+            usedTodayBytes: dailyBudget.usedTodayBytes
+        )
+        guard dailyDecision.allowsUploads else {
+            return finish(.init(success: true,
+                                summary: dailyDecision.pauseReason ?? "Daily upload limit reached"))
+        }
 
         await albums.refresh()
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
@@ -1176,7 +1272,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let failuresBefore = queue.failedCount
         let scan = await libraryChanges.scan(albums: albums,
                                              selectedAlbumIDs: preferences.selectedAlbumIDs,
-                                             accountIdentifier: account.status.email)
+                                             accountIdentifier: account.status.email,
+                                             mediaFilter: preferences.mediaFilter,
+                                             cutoffDate: preferences.backupCutoffDate)
         if Task.isCancelled { return finish(.init(success: false, summary: "iOS ended the window")) }
         // An edited asset already has a completion recorded against its
         // identifier, so the dedup below would drop it. Release those first;
@@ -1430,7 +1528,8 @@ extension AutomaticBackupCoordinator {
             halted: queue.haltReason != nil,
             networkPaused: queue.networkPauseReason != nil,
             systemPaused: queue.systemPauseReason != nil,
-            powerPaused: queue.powerPauseReason != nil
+            powerPaused: queue.powerPauseReason != nil,
+            dailyLimitPaused: queue.dailyLimitPauseReason != nil
         )
     }
 
