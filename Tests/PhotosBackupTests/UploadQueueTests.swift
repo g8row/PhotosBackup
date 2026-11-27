@@ -1590,6 +1590,34 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.items.first { $0.id == finishedID }?.state, .done)
         XCTAssertEqual(queue.items.first { $0.id == stillUploadingID }?.state, .queued)
     }
+
+    /// With background transfer decoupling enabled, a row that has handed its
+    /// file to iOS's background URLSession frees its local preparation slot so
+    /// additional rows prepare up to the background transfer limit, and
+    /// `waitUntilBackgroundHandoff` returns as soon as the batch is handed off.
+    func testDecoupledBackgroundHandoffPreparesMultipleTransfersUnderLocalLimit() async {
+        let prepared = PreparedUpload(uploadURL: URL(string: "https://example.test/upload")!,
+                                      hash: Data(repeating: 1, count: 20), filename: "IMG.JPG",
+                                      modified: Date(timeIntervalSince1970: 100), byteCount: 1_000, receipt: nil)
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                          modified: Date(timeIntervalSince1970: 100), byteCount: 1_000,
+                                          temporary: true, prepared: prepared, continuesAfterProcessExit: true)
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.checkpoint(checkpoint))
+            await emit(.state(.uploading(fraction: 0.1)))
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
+            throw CancellationError()
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.setBackgroundTransferLimit(3, stagingByteBudget: 10_000)
+        queue.enqueue(sources(5))
+
+        let handedOff = await queue.waitUntilBackgroundHandoff(until: Date().addingTimeInterval(3))
+        XCTAssertTrue(handedOff)
+        XCTAssertEqual(queue.runningBackgroundTransferCount, 3)
+        XCTAssertEqual(queue.runningCount, 3)
+        queue.cancelAll()
+    }
 }
 
 private final class StartedIDs: @unchecked Sendable {

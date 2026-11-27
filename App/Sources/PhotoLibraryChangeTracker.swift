@@ -5,7 +5,7 @@ import Photos
 /// insertion, including files whose embedded creation date is years old.
 @MainActor
 final class PhotoLibraryChangeTracker {
-    struct Scan {
+    struct Scan: Sendable {
         let sources: [MediaSource]
         /// Assets PhotoKit reported as *changed* rather than new. Their bytes
         /// may differ from what was uploaded, so the queue has to forget the
@@ -20,7 +20,7 @@ final class PhotoLibraryChangeTracker {
         }
     }
 
-    fileprivate struct StoredState: Codable {
+    fileprivate struct StoredState: Codable, Sendable {
         let context: String
         let token: Data
     }
@@ -37,11 +37,31 @@ final class PhotoLibraryChangeTracker {
         }
     }
 
-    func scan(albums: PhotoAlbumStore, selectedAlbumIDs: Set<String>, accountIdentifier: String?) -> Scan {
+    /// Scan the library off the main actor so a full-library fallback on a
+    /// large library cannot block background expiry handling or UI turns.
+    func scan(albums: PhotoAlbumStore, selectedAlbumIDs: Set<String>, accountIdentifier: String?) async -> Scan {
         let context = ([accountIdentifier?.lowercased() ?? ""] + selectedAlbumIDs.sorted())
             .joined(separator: "\u{1F}")
+        let targets = albums.scanTargets(for: selectedAlbumIDs)
+        let stored = load()
+        return await Task.detached(priority: .utility) {
+            Self.performScan(
+                targets: targets,
+                selectedAlbumIDs: selectedAlbumIDs,
+                context: context,
+                stored: stored
+            )
+        }.value
+    }
+
+    private nonisolated static func performScan(
+        targets: [(id: String, collection: PHAssetCollection?)],
+        selectedAlbumIDs: Set<String>,
+        context: String,
+        stored: StoredState?
+    ) -> Scan {
         guard #available(iOS 16, *) else {
-            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
+            let sources = PhotoAlbumStore.sources(for: targets)
             DiagnosticEventLog.shared.record(
                 "library",
                 "Scanned the selected albums in full (iOS 15 keeps no change history): \(sources.count) items"
@@ -52,10 +72,10 @@ final class PhotoLibraryChangeTracker {
         let library = PHPhotoLibrary.shared()
         let current = library.currentChangeToken
         let next = archive(current).map { StoredState(context: context, token: $0) }
-        guard let stored = load(), stored.context == context,
+        guard let stored, stored.context == context,
               let token = unarchive(stored.token) else {
-            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
-            let why = load() == nil
+            let sources = PhotoAlbumStore.sources(for: targets)
+            let why = stored == nil
                 ? "no earlier scan to compare with"
                 : "the album selection or account changed since the last scan"
             DiagnosticEventLog.shared.record(
@@ -71,6 +91,7 @@ final class PhotoLibraryChangeTracker {
             var updated = Set<String>()
             var selectedCollectionChanged = false
             for change in changes {
+                if Task.isCancelled { return Scan(sources: []) }
                 let assetDetails = try change.changeDetails(for: .asset)
                 inserted.formUnion(assetDetails.insertedLocalIdentifiers)
                 updated.formUnion(assetDetails.updatedLocalIdentifiers)
@@ -83,13 +104,14 @@ final class PhotoLibraryChangeTracker {
                     }
                 }
             }
+            if Task.isCancelled { return Scan(sources: []) }
             // An asset can appear in both sets across a batch of changes; a new
             // asset is not an edit, so insertion wins.
             updated.subtract(inserted)
-            let edited = albums.sources(for: selectedAlbumIDs, matching: updated)
+            let edited = PhotoAlbumStore.sources(for: targets, selectedAlbumIDs: selectedAlbumIDs, matching: updated)
             let sources = selectedCollectionChanged
-                ? albums.sourcesSynchronously(for: selectedAlbumIDs)
-                : albums.sources(for: selectedAlbumIDs, matching: inserted.union(updated))
+                ? PhotoAlbumStore.sources(for: targets)
+                : PhotoAlbumStore.sources(for: targets, selectedAlbumIDs: selectedAlbumIDs, matching: inserted.union(updated))
             DiagnosticEventLog.shared.record(
                 "library",
                 selectedCollectionChanged
@@ -100,7 +122,7 @@ final class PhotoLibraryChangeTracker {
         } catch {
             // Expired/unavailable history requires one correctness-first current
             // scan, after which the fresh token becomes the new baseline.
-            let sources = albums.sourcesSynchronously(for: selectedAlbumIDs)
+            let sources = PhotoAlbumStore.sources(for: targets)
             DiagnosticEventLog.shared.record(
                 "library",
                 "The library's change history was unavailable (\(error.localizedDescription)), so the selection was scanned in full: \(sources.count) items",
@@ -139,12 +161,12 @@ final class PhotoLibraryChangeTracker {
     }
 
     @available(iOS 16, *)
-    private func archive(_ token: PHPersistentChangeToken) -> Data? {
+    private nonisolated static func archive(_ token: PHPersistentChangeToken) -> Data? {
         try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
     }
 
     @available(iOS 16, *)
-    private func unarchive(_ data: Data) -> PHPersistentChangeToken? {
+    private nonisolated static func unarchive(_ data: Data) -> PHPersistentChangeToken? {
         try? NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: data)
     }
 }

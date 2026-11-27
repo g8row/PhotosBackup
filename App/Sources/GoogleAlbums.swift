@@ -37,6 +37,26 @@ struct GoogleAlbumRegistry: Sendable {
     func save(_ key: String?, named name: String, for account: String) throws {
         var albums = albums(for: account)
         albums[name] = key
+        try write(albums, for: account)
+    }
+
+    /// Merge imported album mappings without overwriting existing keys.
+    /// Returns how many new album entries were added.
+    @discardableResult
+    func merge(_ imported: [String: String], for account: String) throws -> Int {
+        guard !imported.isEmpty else { return 0 }
+        var current = albums(for: account)
+        var added = 0
+        for (name, key) in imported where !name.isEmpty && !key.isEmpty && current[name] == nil {
+            current[name] = key
+            added += 1
+        }
+        guard added > 0 else { return 0 }
+        try write(current, for: account)
+        return added
+    }
+
+    private func write(_ albums: [String: String], for account: String) throws {
         let url = url(for: account)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()

@@ -11,6 +11,7 @@ struct PhotosBackupApp: App {
     @StateObject private var albums: PhotoAlbumStore
     @Environment(\.scenePhase) private var scenePhase
     private let network: NetworkPolicyMonitor
+    private let power: PowerPolicyMonitor
     private let automaticBackup: AutomaticBackupCoordinator
 
     init() {
@@ -20,6 +21,7 @@ struct PhotosBackupApp: App {
         let preferences = BackupPreferences()
         let albums = PhotoAlbumStore()
         let network = NetworkPolicyMonitor()
+        let power = PowerPolicyMonitor()
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
         stack.queue.options.filesIntoAlbums = preferences.albumsFromLibrary
@@ -30,7 +32,8 @@ struct PhotosBackupApp: App {
             queue: stack.queue,
             preferences: preferences,
             albums: albums,
-            network: network
+            network: network,
+            power: power
         )
         BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
             await automaticBackup?.handleBackgroundURLSessionEvents()
@@ -45,6 +48,7 @@ struct PhotosBackupApp: App {
         _preferences = StateObject(wrappedValue: preferences)
         _albums = StateObject(wrappedValue: albums)
         self.network = network
+        self.power = power
         self.automaticBackup = automaticBackup
         if #available(iOS 16.0, *) {
             BackupShortcutBridge.coordinator = automaticBackup
@@ -54,7 +58,13 @@ struct PhotosBackupApp: App {
             automaticBackup?.networkDidChange()
         }
         network.start()
+        power.onStatusChange = { [weak automaticBackup] status in
+            DiagnosticEventLog.shared.record("power", "Power changed to \(status.diagnosticLabel)")
+            automaticBackup?.powerDidChange()
+        }
+        power.start()
         automaticBackup.applyNetworkPolicy()
+        automaticBackup.applyPowerPolicy()
     }
 
     var body: some Scene {
@@ -111,6 +121,18 @@ struct PhotosBackupApp: App {
                 .onChange(of: preferences.keepAliveMode) { value in
                     DiagnosticEventLog.shared.record("settings", "Keep-alive mode set to \(value.title)")
                     automaticBackup.keepAlivePreferenceDidChange()
+                }
+                .onChange(of: preferences.onlyWhileCharging) { value in
+                    DiagnosticEventLog.shared.record("settings", "Only While Charging turned \(value ? "on" : "off")")
+                    automaticBackup.powerPreferenceDidChange()
+                }
+                .onChange(of: preferences.minimumBatteryPercent) { value in
+                    DiagnosticEventLog.shared.record("settings", "Minimum battery set to \(value == 0 ? "off" : "\(value)%")")
+                    automaticBackup.powerPreferenceDidChange()
+                }
+                .onChange(of: preferences.significantLocationWake) { value in
+                    DiagnosticEventLog.shared.record("settings", "Wake on Location Change turned \(value ? "on" : "off")")
+                    automaticBackup.significantLocationWakePreferenceDidChange()
                 }
                 .onChange(of: preferences.concurrentUploads) { value in
                     DiagnosticEventLog.shared.record("settings", "Simultaneous uploads set to \(value)")

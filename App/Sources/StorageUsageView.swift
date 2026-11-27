@@ -1,9 +1,15 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct StorageUsageView: View {
+    @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
     @State private var snapshot: AppStorageSnapshot?
     @State private var isCleaning = false
+    @State private var exportDocument: BackupHistoryDocument?
+    @State private var showExporter = false
+    @State private var showImporter = false
+    @State private var historyMessage: String?
 
     var body: some View {
         List {
@@ -15,6 +21,33 @@ struct StorageUsageView: View {
 
             Section("System-managed") {
                 storageRow("Network and web caches", bytes: snapshot?.caches)
+            }
+
+            Section {
+                Button {
+                    prepareExport()
+                } label: {
+                    Label("Export Backup History", systemImage: "square.and.arrow.up")
+                }
+                .disabled(!account.status.isUsable)
+
+                Button {
+                    showImporter = true
+                } label: {
+                    Label("Import Backup History", systemImage: "square.and.arrow.down")
+                }
+                .disabled(!account.status.isUsable)
+
+                if let historyMessage {
+                    Text(historyMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("Backup History")
+            } footer: {
+                Text("Exports the list of items already backed up (and Google album links) as a small JSON file with no credentials or photos. Import it after reinstalling or switching signing certificates to avoid re-checking your whole library.")
             }
 
             Section {
@@ -41,6 +74,26 @@ struct StorageUsageView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task { await refresh() }
         .refreshable { await refresh() }
+        .fileExporter(
+            isPresented: $showExporter,
+            document: exportDocument,
+            contentType: .json,
+            defaultFilename: "PhotosBackup-History"
+        ) { result in
+            switch result {
+            case .success:
+                historyMessage = "Exported \(queue.completedSourceCount.formatted()) backed-up item records."
+                DiagnosticEventLog.shared.record(
+                    "storage",
+                    "Exported backup history (\(queue.completedSourceKeys.count) ledger keys)"
+                )
+            case .failure(let error):
+                historyMessage = "Export failed: \(error.localizedDescription)"
+            }
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.json]) { result in
+            importHistory(result)
+        }
     }
 
     @ViewBuilder
@@ -73,6 +126,44 @@ struct StorageUsageView: View {
                 )
             }
             isCleaning = false
+        }
+    }
+
+    private func prepareExport() {
+        guard let email = account.status.email else { return }
+        let albums = GoogleAlbumRegistry().albums(for: email)
+        let archive = BackupHistoryArchive(
+            completedSourceKeys: Array(queue.completedSourceKeys),
+            googleAlbums: albums
+        )
+        do {
+            exportDocument = try BackupHistoryDocument(archive: archive)
+            historyMessage = nil
+            showExporter = true
+        } catch {
+            historyMessage = "Could not prepare export: \(error.localizedDescription)"
+        }
+    }
+
+    private func importHistory(_ result: Result<URL, Error>) {
+        guard let email = account.status.email else { return }
+        switch result {
+        case .failure(let error):
+            historyMessage = "Could not open that file: \(error.localizedDescription)"
+        case .success(let url):
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try Data(contentsOf: url)
+                let archive = try BackupHistoryArchive.decode(data)
+                let importedKeys = queue.importCompletedSourceKeys(archive.completedSourceKeys)
+                let importedAlbums = (try? GoogleAlbumRegistry().merge(archive.googleAlbums, for: email)) ?? 0
+                historyMessage = "Imported \(importedKeys.formatted()) new history record\(importedKeys == 1 ? "" : "s")"
+                    + (importedAlbums > 0 ? " and \(importedAlbums.formatted()) album link\(importedAlbums == 1 ? "" : "s")." : ".")
+                Task { await refresh() }
+            } catch {
+                historyMessage = "Import failed: \(error.localizedDescription)"
+            }
         }
     }
 

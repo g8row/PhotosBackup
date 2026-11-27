@@ -25,8 +25,9 @@ enum ContinuedBackupPolicy {
     /// so it keeps the task; a pause that needs the user, a connection, the
     /// account or a new iOS window does not.
     static func shouldContinue(hasWorkableItems: Bool, userPaused: Bool, halted: Bool,
-                               networkPaused: Bool, systemPaused: Bool) -> Bool {
-        hasWorkableItems && !userPaused && !halted && !networkPaused && !systemPaused
+                               networkPaused: Bool, systemPaused: Bool,
+                               powerPaused: Bool = false) -> Bool {
+        hasWorkableItems && !userPaused && !halted && !networkPaused && !systemPaused && !powerPaused
     }
 
     /// The identifier prefixes to submit under, best first. iOS wants the
